@@ -219,6 +219,68 @@ class TestTypes(fixtures.TestBase, AssertsExecutionResults):
                 isinstance(bindproc(util.u('some string')), util.text_type)
 
 
+class JSONTest(fixtures.TestBase):
+
+    __requires__ = ('json_type', )
+    __only_on__ = 'sqlite'
+
+    @testing.provide_metadata
+    @testing.requires.reflects_json_type
+    def test_reflection(self):
+        Table(
+            'json_test', self.metadata,
+            Column('foo', sqlite.JSON)
+        )
+        self.metadata.create_all()
+
+        reflected = Table('json_test', MetaData(), autoload_with=testing.db)
+        is_(reflected.c.foo.type._type_affinity, sqltypes.JSON)
+        assert isinstance(reflected.c.foo.type, sqlite.JSON)
+
+    @testing.provide_metadata
+    def test_rudimentary_roundtrip(self):
+        sqlite_json = Table(
+            'json_test', self.metadata,
+            Column('foo', sqlite.JSON)
+        )
+
+        self.metadata.create_all()
+
+        value = {
+            'json': {'foo': 'bar'},
+            'recs': ['one', 'two']
+        }
+
+        with testing.db.connect() as conn:
+            conn.execute(sqlite_json.insert(), foo=value)
+
+            eq_(
+                conn.scalar(select([sqlite_json.c.foo])),
+                value
+            )
+
+    @testing.provide_metadata
+    def test_extract_subobject(self):
+        sqlite_json = Table(
+            'json_test', self.metadata,
+            Column('foo', sqlite.JSON)
+        )
+
+        self.metadata.create_all()
+
+        value = {
+            'json': {'foo': 'bar'},
+        }
+
+        with testing.db.connect() as conn:
+            conn.execute(sqlite_json.insert(), foo=value)
+
+            eq_(
+                conn.scalar(select([sqlite_json.c.foo['json']])),
+                value['json']
+            )
+
+
 class DateTimeTest(fixtures.TestBase, AssertsCompiledSQL):
 
     def test_time_microseconds(self):
@@ -1065,6 +1127,31 @@ class ReflectHeadlessFKsTest(fixtures.TestBase):
         assert b.c.id.references(a.c.id)
 
 
+class KeywordInDatabaseNameTest(fixtures.TestBase):
+    __only_on__ = 'sqlite'
+
+    @classmethod
+    def setup_class(cls):
+        with testing.db.begin() as conn:
+            conn.execute("ATTACH %r AS \"default\"" % conn.engine.url.database)
+            conn.execute('CREATE TABLE "default".a (id INTEGER PRIMARY KEY)')
+
+    @classmethod
+    def teardown_class(cls):
+        with testing.db.begin() as conn:
+            try:
+                conn.execute('drop table "default".a')
+            except Exception:
+                pass
+            conn.execute('DETACH DATABASE "default"')
+
+    def test_reflect(self):
+        with testing.db.begin() as conn:
+            meta = MetaData(bind=conn, schema='default')
+            meta.reflect()
+            assert 'default.a' in meta.tables
+
+
 class ConstraintReflectionTest(fixtures.TestBase):
     __only_on__ = 'sqlite'
 
@@ -1637,7 +1724,7 @@ class TypeReflectionTest(fixtures.TestBase):
             ("BLOBBER", sqltypes.NullType()),
             ("DOUBLE PRECISION", sqltypes.REAL()),
             ("FLOATY", sqltypes.REAL()),
-            ("NOTHING WE KNOW", sqltypes.NUMERIC()),
+            ("SOMETHING UNKNOWN", sqltypes.NUMERIC()),
         ]
 
     def _fixture_as_string(self, fixture):

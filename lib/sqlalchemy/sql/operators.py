@@ -494,20 +494,84 @@ class ColumnOperators(Operators):
     def in_(self, other):
         """Implement the ``in`` operator.
 
-        In a column context, produces the clause ``a IN other``.
-        "other" may be a tuple/list of column expressions,
-        or a :func:`~.expression.select` construct.
+        In a column context, produces the clause ``column IN <other>``.
 
-        In the case that ``other`` is an empty sequence, the compiler
-        produces an "empty in" expression.   This defaults to the
-        expression "1 != 1" to produce false in all cases.  The
-        :paramref:`.create_engine.empty_in_strategy` may be used to
-        alter this behavior.
+        The given parameter ``other`` may be:
 
-        .. versionchanged:: 1.2  The :meth:`.ColumnOperators.in_` and
-           :meth:`.ColumnOperators.notin_` operators
-           now produce a "static" expression for an empty IN sequence
-           by default.
+        * A list of literal values, e.g.::
+
+            stmt.where(column.in_([1, 2, 3]))
+
+          In this calling form, the list of items is converted to a set of
+          bound parameters the same length as the list given::
+
+            WHERE COL IN (?, ?, ?)
+
+        * An empty list, e.g.::
+
+            stmt.where(column.in_([]))
+
+          In this calling form, the expression renders a "false" expression,
+          e.g.::
+
+            WHERE 1 != 1
+
+          This "false" expression has historically had different behaviors
+          in older SQLAlchemy versions, see
+          :paramref:`.create_engine.empty_in_strategy` for behavioral options.
+
+          .. versionchanged:: 1.2 simplified the behavior of "empty in"
+             expressions
+
+        * A bound parameter, e.g. :func:`.bindparam`, may be used if it
+          includes the :paramref:`.bindparam.expanding` flag::
+
+            stmt.where(column.in_(bindparam('value', expanding=True)))
+
+          In this calling form, the expression renders a special non-SQL
+          placeholder expression that looks like::
+
+            WHERE COL IN ([EXPANDING_value])
+
+          This placeholder expression is intercepted at statement execution
+          time to be converted into the variable number of bound parameter
+          form illustrated earlier.   If the statement were executed as::
+
+            connection.execute(stmt, {"value": [1, 2, 3]})
+
+          The database would be passed a bound parameter for each value::
+
+            WHERE COL IN (?, ?, ?)
+
+          .. versionadded:: 1.2 added "expanding" bound parameters
+
+          If an empty list is passed, a special "empty list" expression,
+          which is specific to the database in use, is rendered.  On
+          SQLite this would be::
+
+            WHERE COL IN (SELECT 1 FROM (SELECT 1) WHERE 1!=1)
+
+          .. versionadded:: 1.3 "expanding" bound parameters now support
+             empty lists
+
+        * a :func:`.select` construct, which is usually a correlated
+          scalar select::
+
+            stmt.where(
+                column.in_(
+                    select([othertable.c.y]).
+                    where(table.c.x == othertable.c.x)
+                )
+            )
+
+          In this calling form, :meth:`.ColumnOperators.in_` renders as given::
+
+            WHERE COL IN (SELECT othertable.y
+            FROM othertable WHERE othertable.x = table.x)
+
+        :param other: a list of literals, a :func:`.select` construct,
+         or a :func:`.bindparam` construct that includes the
+         :paramref:`.bindparam.expanding` flag set to True.
 
         """
         return self.operate(in_op, other)
@@ -1074,8 +1138,26 @@ class ColumnOperators(Operators):
         """
         return self.reverse_operate(truediv, other)
 
+_commutative = {eq, ne, add, mul}
+_comparison = {eq, ne, lt, gt, ge, le}
+
+
+def commutative_op(fn):
+    _commutative.add(fn)
+    return fn
+
+
+def comparison_op(fn):
+    _comparison.add(fn)
+    return fn
+
 
 def from_():
+    raise NotImplementedError()
+
+
+@comparison_op
+def function_as_comparison_op():
     raise NotImplementedError()
 
 
@@ -1095,18 +1177,22 @@ def isfalse(a):
     raise NotImplementedError()
 
 
+@comparison_op
 def is_distinct_from(a, b):
     return a.is_distinct_from(b)
 
 
+@comparison_op
 def isnot_distinct_from(a, b):
     return a.isnot_distinct_from(b)
 
 
+@comparison_op
 def is_(a, b):
     return a.is_(b)
 
 
+@comparison_op
 def isnot(a, b):
     return a.isnot(b)
 
@@ -1119,34 +1205,42 @@ def op(a, opstring, b):
     return a.op(opstring)(b)
 
 
+@comparison_op
 def like_op(a, b, escape=None):
     return a.like(b, escape=escape)
 
 
+@comparison_op
 def notlike_op(a, b, escape=None):
     return a.notlike(b, escape=escape)
 
 
+@comparison_op
 def ilike_op(a, b, escape=None):
     return a.ilike(b, escape=escape)
 
 
+@comparison_op
 def notilike_op(a, b, escape=None):
     return a.notilike(b, escape=escape)
 
 
+@comparison_op
 def between_op(a, b, c, symmetric=False):
     return a.between(b, c, symmetric=symmetric)
 
 
+@comparison_op
 def notbetween_op(a, b, c, symmetric=False):
     return a.notbetween(b, c, symmetric=symmetric)
 
 
+@comparison_op
 def in_op(a, b):
     return a.in_(b)
 
 
+@comparison_op
 def notin_op(a, b):
     return a.notin_(b)
 
@@ -1185,34 +1279,42 @@ def _escaped_like_impl(fn, other, escape, autoescape):
     return fn(other, escape=escape)
 
 
+@comparison_op
 def startswith_op(a, b, escape=None, autoescape=False):
     return _escaped_like_impl(a.startswith, b, escape, autoescape)
 
 
+@comparison_op
 def notstartswith_op(a, b, escape=None, autoescape=False):
     return ~_escaped_like_impl(a.startswith, b, escape, autoescape)
 
 
+@comparison_op
 def endswith_op(a, b, escape=None, autoescape=False):
     return _escaped_like_impl(a.endswith, b, escape, autoescape)
 
 
+@comparison_op
 def notendswith_op(a, b, escape=None, autoescape=False):
     return ~_escaped_like_impl(a.endswith, b, escape, autoescape)
 
 
+@comparison_op
 def contains_op(a, b, escape=None, autoescape=False):
     return _escaped_like_impl(a.contains, b, escape, autoescape)
 
 
+@comparison_op
 def notcontains_op(a, b, escape=None, autoescape=False):
     return ~_escaped_like_impl(a.contains, b, escape, autoescape)
 
 
+@comparison_op
 def match_op(a, b, **kw):
     return a.match(b, **kw)
 
 
+@comparison_op
 def notmatch_op(a, b, **kw):
     return a.notmatch(b, **kw)
 
@@ -1221,10 +1323,12 @@ def comma_op(a, b):
     raise NotImplementedError()
 
 
+@comparison_op
 def empty_in_op(a, b):
     raise NotImplementedError()
 
 
+@comparison_op
 def empty_notin_op(a, b):
     raise NotImplementedError()
 
@@ -1257,12 +1361,6 @@ def json_path_getitem_op(a, b):
     raise NotImplementedError()
 
 
-_commutative = {eq, ne, add, mul}
-
-_comparison = {eq, ne, lt, gt, ge, le, between_op, like_op, is_,
-               isnot, is_distinct_from, isnot_distinct_from}
-
-
 def is_comparison(op):
     return op in _comparison or \
         isinstance(op, custom_op) and op.is_comparison
@@ -1280,6 +1378,12 @@ def is_ordering_modifier(op):
 def is_natural_self_precedent(op):
     return op in _natural_self_precedent or \
         isinstance(op, custom_op) and op.natural_self_precedent
+
+_booleans = (inv, istrue, isfalse, and_, or_)
+
+
+def is_boolean(op):
+    return is_comparison(op) or op in _booleans
 
 _mirror = {
     gt: lt,
@@ -1314,6 +1418,7 @@ _largest = util.symbol('_largest', canonical=100)
 
 _PRECEDENCE = {
     from_: 15,
+    function_as_comparison_op: 15,
     any_op: 15,
     all_op: 15,
     getitem: 15,

@@ -108,11 +108,11 @@ copyright = u'2007-2018, the SQLAlchemy authors and contributors'
 # built documents.
 #
 # The short X.Y version.
-version = "1.2"
+version = "1.3"
 # The full version, including alpha/beta/rc tags.
-release = "1.2.4"
+release = "1.3.0b1"
 
-release_date = "February 22, 2018"
+release_date = None
 
 site_base = os.environ.get("RTD_SITE_BASE", "http://www.sqlalchemy.org")
 site_adapter_template = "docs_adapter.mako"
@@ -260,8 +260,8 @@ htmlhelp_basename = 'SQLAlchemydoc'
 # Grouping the document tree into LaTeX files. List of tuples
 # (source start file, target name, title, author, documentclass [howto/manual]).
 latex_documents = [
-  ('contents', 'sqlalchemy_%s.tex' % release.replace('.', '_'), ur'SQLAlchemy Documentation',
-   ur'Mike Bayer', 'manual'),
+  ('contents', 'sqlalchemy_%s.tex' % release.replace('.', '_'), 'SQLAlchemy Documentation',
+   'Mike Bayer', 'manual'),
 ]
 
 # The name of an image file (relative to this directory) to place at the top of

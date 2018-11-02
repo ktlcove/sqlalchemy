@@ -141,6 +141,22 @@ class DefaultRequirements(SuiteRequirements):
         ])
 
     @property
+    def non_native_boolean_unconstrained(self):
+        """target database is not native boolean and allows arbitrary integers
+        in it's "bool" column"""
+
+        return skip_if([
+            LambdaPredicate(
+                lambda config: against(config, "mssql"),
+                "SQL Server drivers / odbc seem to change their mind on this"
+            ),
+            LambdaPredicate(
+                lambda config: config.db.dialect.supports_native_boolean,
+                "native boolean dialect"
+            )
+        ])
+
+    @property
     def standalone_binds(self):
         """target database/driver supports bound parameters as column expressions
         without being in the context of a typed column.
@@ -314,6 +330,14 @@ class DefaultRequirements(SuiteRequirements):
         ])
 
     @property
+    def sequences_as_server_defaults(self):
+        """Target database must support SEQUENCE as a server side default."""
+
+        return only_on(
+            'postgresql',
+            "doesn't support sequences as a server side default.")
+
+    @property
     def correlated_outer_joins(self):
         """Target must support an outer join to a subquery which
         correlates to the parent."""
@@ -332,12 +356,12 @@ class DefaultRequirements(SuiteRequirements):
     def delete_from(self):
         """Target must support DELETE FROM..FROM or DELETE..USING syntax"""
         return only_on(['postgresql', 'mssql', 'mysql', 'sybase'],
-                       "Backend does not support UPDATE..FROM")
+                       "Backend does not support DELETE..FROM")
 
     @property
     def update_where_target_in_subquery(self):
-        """Target must support UPDATE where the same table is present in a
-        subquery in the WHERE clause.
+        """Target must support UPDATE (or DELETE) where the same table is
+        present in a subquery in the WHERE clause.
 
         This is an ANSI-standard syntax that apparently MySQL can't handle,
         such as:
@@ -347,9 +371,10 @@ class DefaultRequirements(SuiteRequirements):
                 FROM documents GROUP BY documents.user_id
             )
         """
-        return fails_if('mysql',
-                        'MySQL error 1093 "Cant specify target table '
-                        'for update in FROM clause"')
+        return fails_if(
+            self._mysql_not_mariadb_103,
+            'MySQL error 1093 "Cant specify target table '
+            'for update in FROM clause", resolved by MariaDB 10.3')
 
     @property
     def savepoints(self):
@@ -383,8 +408,23 @@ class DefaultRequirements(SuiteRequirements):
         """target system must support reflection of inter-schema foreign keys
         """
         return only_on([
-                    "postgresql"
+                    "postgresql",
+                    "mysql",
+                    "mssql",
                 ])
+
+    @property
+    def implicit_default_schema(self):
+        """target system has a strong concept of 'default' schema that can
+           be referred to implicitly.
+
+           basically, Postgresql.
+
+        """
+        return only_on([
+                    "postgresql",
+                ])
+
 
     @property
     def unique_constraint_reflection(self):
@@ -435,14 +475,34 @@ class DefaultRequirements(SuiteRequirements):
     def ctes(self):
         """Target database supports CTEs"""
 
-        return only_if(
-            ['postgresql', 'mssql']
-        )
+        return only_on([
+            lambda config: against(config, "mysql") and (
+                config.db.dialect._is_mariadb and
+                config.db.dialect._mariadb_normalized_version_info >=
+                (10, 2)
+            ),
+            "postgresql",
+            "mssql",
+            "oracle"
+        ])
+
+    @property
+    def ctes_with_update_delete(self):
+        """target database supports CTES that ride on top of a normal UPDATE
+        or DELETE statement which refers to the CTE in a correlated subquery.
+
+        """
+        return only_on([
+            "postgresql",
+            "mssql",
+            # "oracle" - oracle can do this but SQLAlchemy doesn't support
+            # their syntax yet
+        ])
 
     @property
     def ctes_on_dml(self):
         """target database supports CTES which consist of INSERT, UPDATE
-        or DELETE"""
+        or DELETE *within* the CTE, e.g. WITH x AS (UPDATE....)"""
 
         return only_if(
             ['postgresql']
@@ -462,15 +522,17 @@ class DefaultRequirements(SuiteRequirements):
         """Target database must support INTERSECT or equivalent."""
 
         return fails_if([
-                "firebird", "mysql", "sybase",
-            ], 'no support for INTERSECT')
+            "firebird", self._mysql_not_mariadb_103,
+            "sybase",
+        ], 'no support for INTERSECT')
 
     @property
     def except_(self):
         """Target database must support EXCEPT or equivalent (i.e. MINUS)."""
         return fails_if([
-                "firebird", "mysql", "sybase",
-            ], 'no support for EXCEPT')
+            "firebird", self._mysql_not_mariadb_103,
+            "sybase",
+        ], 'no support for EXCEPT')
 
     @property
     def order_by_col_from_union(self):
@@ -678,7 +740,8 @@ class DefaultRequirements(SuiteRequirements):
                         (10, 2, 7)
                     )
                 ),
-            "postgresql >= 9.3"
+            "postgresql >= 9.3",
+            "sqlite >= 3.9"
         ])
 
     @property
@@ -686,7 +749,8 @@ class DefaultRequirements(SuiteRequirements):
         return only_on([
             lambda config: against(config, "mysql >= 5.7") and
             not config.db.dialect._is_mariadb,
-            "postgresql >= 9.3"
+            "postgresql >= 9.3",
+            "sqlite >= 3.9"
         ])
 
     @property
@@ -863,6 +927,41 @@ class DefaultRequirements(SuiteRequirements):
              'only four decimal places ')])
 
     @property
+    def implicit_decimal_binds(self):
+        """target backend will return a selected Decimal as a Decimal, not
+        a string.
+
+        e.g.::
+
+            expr = decimal.Decimal("15.7563")
+
+            value = e.scalar(
+                select([literal(expr)])
+            )
+
+            assert value == expr
+
+        See :ticket:`4036`
+
+        """
+
+        # fixed for mysqlclient in
+        # https://github.com/PyMySQL/mysqlclient-python/commit/68b9662918577fc05be9610ef4824a00f2b051b0
+        def check(config):
+            if against(config, "mysql+mysqldb"):
+                # can remove once post 1.3.13 is released
+                try:
+                    from MySQLdb import converters
+                    from decimal import Decimal
+                    return Decimal not in converters.conversions
+                except:
+                    return True
+
+            return against(config, "mysql+mysqldb") and \
+                config.db.dialect._mysql_dbapi_version <= (1, 3, 13)
+        return exclusions.fails_on(check, "fixed for mysqlclient post 1.3.13")
+
+    @property
     def fetch_null_from_numeric(self):
         return skip_if(
                     ("mssql+pyodbc", None, None, "crashes due to bug #351"),
@@ -982,7 +1081,9 @@ class DefaultRequirements(SuiteRequirements):
             # will raise without quoting
             "postgresql": "POSIX",
 
-            "mysql": "latin1_general_ci",
+            # note MySQL databases need to be created w/ utf8mb3 charset
+            # for the test suite
+            "mysql": "utf8mb3_bin",
             "sqlite": "NOCASE",
 
             # will raise *with* quoting
@@ -1011,11 +1112,26 @@ class DefaultRequirements(SuiteRequirements):
             "works, but Oracle just gets tired with "
             "this much connection activity")
 
-
-
     @property
     def no_mssql_freetds(self):
         return self.mssql_freetds.not_()
+
+    @property
+    def pyodbc_fast_executemany(self):
+        def has_fastexecutemany(config):
+            if not against(config, "mssql+pyodbc"):
+                return False
+            if config.db.dialect._dbapi_version() < (4, 0, 19):
+                return False
+            with config.db.connect() as conn:
+                drivername = conn.connection.connection.getinfo(
+                    config.db.dialect.dbapi.SQL_DRIVER_NAME)
+                # on linux this is 'libmsodbcsql-13.1.so.9.2'.
+                # don't know what it is on windows
+                return "msodbc" in drivername
+        return only_if(
+            has_fastexecutemany,
+            "only on pyodbc > 4.0.19 w/ msodbc driver")
 
     @property
     def python_fixed_issue_8743(self):
@@ -1029,6 +1145,13 @@ class DefaultRequirements(SuiteRequirements):
         """target driver must support the literal statement 'select 1'"""
         return skip_if(["oracle", "firebird"],
                        "non-standard SELECT scalar syntax")
+
+    @property
+    def mysql_for_update(self):
+        return skip_if(
+            "mysql+mysqlconnector",
+           "lock-sensitive operations crash on mysqlconnector"
+        )
 
     @property
     def mysql_fsp(self):
@@ -1060,6 +1183,14 @@ class DefaultRequirements(SuiteRequirements):
 
         return only_if(check)
 
+    @property
+    def mysql_ngram_fulltext(self):
+        def check(config):
+            return against(config, "mysql") and \
+                not config.db.dialect._is_mariadb and \
+                config.db.dialect.server_version_info >= (5, 7)
+        return only_if(check)
+
     def _mariadb_102(self, config):
         return against(config, "mysql") and \
                 config.db.dialect._is_mariadb and \
@@ -1069,6 +1200,12 @@ class DefaultRequirements(SuiteRequirements):
         return against(config, "mysql") and (
             not config.db.dialect._is_mariadb or
             config.db.dialect._mariadb_normalized_version_info < (10, 2)
+        )
+
+    def _mysql_not_mariadb_103(self, config):
+        return against(config, "mysql") and (
+            not config.db.dialect._is_mariadb or
+            config.db.dialect._mariadb_normalized_version_info < (10, 3)
         )
 
     def _has_mysql_on_windows(self, config):

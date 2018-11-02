@@ -12,7 +12,7 @@
     :dbapi: pymysql
     :connectstring: mysql+pymysql://<username>:<password>@<host>/<dbname>\
 [?<options>]
-    :url: http://www.pymysql.org/
+    :url: https://pymysql.readthedocs.io/
 
 Unicode
 -------
@@ -60,6 +60,14 @@ class MySQLDialect_pymysql(MySQLDialect_mysqldb):
     @classmethod
     def dbapi(cls):
         return __import__('pymysql')
+
+    def is_disconnect(self, e, connection, cursor):
+        if super(MySQLDialect_pymysql, self).is_disconnect(e, connection, cursor):
+            return True
+        elif isinstance(e, self.dbapi.Error):
+            return "Already closed" in str(e)
+        else:
+            return False
 
     if py3k:
         def _extract_error_code(self, exception):

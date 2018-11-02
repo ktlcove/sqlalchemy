@@ -7,6 +7,7 @@ from sqlalchemy.testing.util import gc_collect, lazy_gc
 from sqlalchemy.testing import eq_, assert_raises, is_not_, is_
 from sqlalchemy.testing.engines import testing_engine
 from sqlalchemy.testing import fixtures
+from sqlalchemy.testing import assert_raises_message
 import random
 from sqlalchemy.testing.mock import Mock, call, patch, ANY
 import weakref
@@ -729,6 +730,35 @@ class PoolEventsTest(PoolTestBase):
         eq_(canary, ["listen_one", "listen_two"])
         p2.connect()
         eq_(canary, ["listen_one", "listen_two", "listen_one", "listen_three"])
+
+    def test_connect_event_fails_invalidates(self):
+        fail = False
+
+        def listen_one(conn, rec):
+            if fail:
+                raise Exception("it failed")
+
+        def listen_two(conn, rec):
+            rec.info['important_flag'] = True
+
+        p1 = pool.QueuePool(
+            creator=MockDBAPI().connect, pool_size=1, max_overflow=0)
+        event.listen(p1, 'connect', listen_one)
+        event.listen(p1, 'connect', listen_two)
+
+        conn = p1.connect()
+        eq_(conn.info['important_flag'], True)
+        conn.invalidate()
+        conn.close()
+
+        fail = True
+        assert_raises(Exception, p1.connect)
+
+        fail = False
+
+        conn = p1.connect()
+        eq_(conn.info['important_flag'], True)
+        conn.close()
 
     def teardown(self):
         # TODO: need to get remove() functionality
@@ -1531,7 +1561,7 @@ class QueuePoolTest(PoolTestBase):
         self.assert_(p.checkedout() == 0)
 
     def test_recycle(self):
-        with patch("sqlalchemy.pool.time.time") as mock:
+        with patch("sqlalchemy.pool.base.time.time") as mock:
             mock.return_value = 10000
 
             p = self._queuepool_fixture(
@@ -1941,6 +1971,95 @@ class QueuePoolTest(PoolTestBase):
         c2 = p.connect()
         assert c2.connection is not None
 
+    def test_no_double_checkin(self):
+        p = self._queuepool_fixture(pool_size=1)
+
+        c1 = p.connect()
+        rec = c1._connection_record
+        c1.close()
+        assert_raises_message(
+            Warning,
+            "Double checkin attempted on %s" % rec,
+            rec.checkin
+        )
+
+    def test_lifo(self):
+        c1, c2, c3 = Mock(), Mock(), Mock()
+        connections = [c1, c2, c3]
+
+        def creator():
+            return connections.pop(0)
+
+        p = pool.QueuePool(creator, use_lifo=True)
+
+        pc1 = p.connect()
+        pc2 = p.connect()
+        pc3 = p.connect()
+
+        pc1.close()
+        pc2.close()
+        pc3.close()
+
+        for i in range(5):
+            pc1 = p.connect()
+            is_(pc1.connection, c3)
+            pc1.close()
+
+            pc1 = p.connect()
+            is_(pc1.connection, c3)
+
+            pc2 = p.connect()
+            is_(pc2.connection, c2)
+            pc2.close()
+
+            pc3 = p.connect()
+            is_(pc3.connection, c2)
+
+            pc2 = p.connect()
+            is_(pc2.connection, c1)
+
+            pc2.close()
+            pc3.close()
+            pc1.close()
+
+    def test_fifo(self):
+        c1, c2, c3 = Mock(), Mock(), Mock()
+        connections = [c1, c2, c3]
+
+        def creator():
+            return connections.pop(0)
+
+        p = pool.QueuePool(creator)
+
+        pc1 = p.connect()
+        pc2 = p.connect()
+        pc3 = p.connect()
+
+        pc1.close()
+        pc2.close()
+        pc3.close()
+
+        pc1 = p.connect()
+        is_(pc1.connection, c1)
+        pc1.close()
+
+        pc1 = p.connect()
+        is_(pc1.connection, c2)
+
+        pc2 = p.connect()
+        is_(pc2.connection, c3)
+        pc2.close()
+
+        pc3 = p.connect()
+        is_(pc3.connection, c1)
+
+        pc2 = p.connect()
+        is_(pc2.connection, c3)
+
+        pc2.close()
+        pc3.close()
+        pc1.close()
+
 
 class ResetOnReturnTest(PoolTestBase):
     def _fixture(self, **kw):
@@ -2033,6 +2152,27 @@ class ResetOnReturnTest(PoolTestBase):
         eq_(dbapi.connect().special_commit.call_count, 1)
         assert not dbapi.connect().rollback.called
         assert dbapi.connect().commit.called
+
+    def test_reset_agent_disconnect(self):
+        dbapi, p = self._fixture(reset_on_return='rollback')
+
+        class Agent(object):
+            def __init__(self, conn):
+                self.conn = conn
+
+            def rollback(self):
+                p._invalidate(self.conn)
+                raise Exception("hi")
+
+            def commit(self):
+                self.conn.commit()
+
+        c1 = p.connect()
+        c1._reset_agent = Agent(c1)
+        c1.close()
+
+        # no warning raised.  We know it would warn due to
+        # QueuePoolTest.test_no_double_checkin
 
 
 class SingletonThreadPoolTest(PoolTestBase):

@@ -54,13 +54,13 @@ including ``ENGINE``, ``CHARSET``, ``MAX_ROWS``, ``ROW_FORMAT``,
 ``INSERT_METHOD``, and many more.
 To accommodate the rendering of these arguments, specify the form
 ``mysql_argument_name="value"``.  For example, to specify a table with
-``ENGINE`` of ``InnoDB``, ``CHARSET`` of ``utf8``, and ``KEY_BLOCK_SIZE``
+``ENGINE`` of ``InnoDB``, ``CHARSET`` of ``utf8mb4``, and ``KEY_BLOCK_SIZE``
 of ``1024``::
 
   Table('mytable', metadata,
         Column('data', String(32)),
         mysql_engine='InnoDB',
-        mysql_charset='utf8',
+        mysql_charset='utf8mb4',
         mysql_key_block_size="1024"
        )
 
@@ -213,7 +213,7 @@ a connection.   This is typically delivered using the ``charset`` parameter
 in the URL, such as::
 
     e = create_engine(
-        "mysql+pymysql://scott:tiger@localhost/test?charset=utf8")
+        "mysql+pymysql://scott:tiger@localhost/test?charset=utf8mb4")
 
 This charset is the **client character set** for the connection.  Some
 MySQL DBAPIs will default this to a value such as ``latin1``, and some
@@ -223,8 +223,10 @@ for specific behavior.
 
 The encoding used for Unicode has traditionally been ``'utf8'``.  However,
 for MySQL versions 5.5.3 on forward, a new MySQL-specific encoding
-``'utf8mb4'`` has been introduced.   The rationale for this new encoding
-is due to the fact that MySQL's utf-8 encoding only supports
+``'utf8mb4'`` has been introduced, and as of MySQL 8.0 a warning is emitted
+by the server if plain ``utf8`` is specified within any server-side
+directives, replaced with ``utf8mb3``.   The rationale for this new encoding
+is due to the fact that MySQL's legacy utf-8 encoding only supports
 codepoints up to three bytes instead of four.  Therefore,
 when communicating with a MySQL database
 that includes codepoints more than three bytes in size,
@@ -234,12 +236,11 @@ as the client DBAPI, as in::
     e = create_engine(
         "mysql+pymysql://scott:tiger@localhost/test?charset=utf8mb4")
 
-At the moment, up-to-date versions of MySQLdb and PyMySQL support the
-``utf8mb4`` charset.   Other DBAPIs such as MySQL-Connector and OurSQL
-may **not** support it as of yet.
+All modern DBAPIs should support the ``utf8mb4`` charset.
 
-In order to use ``utf8mb4`` encoding, changes to
-the MySQL schema and/or server configuration may be required.
+In order to use ``utf8mb4`` encoding for a schema that was created with  legacy
+``utf8``, changes to the MySQL schema and/or server configuration may be
+required.
 
 .. seealso::
 
@@ -247,43 +248,48 @@ the MySQL schema and/or server configuration may be required.
     <http://dev.mysql.com/doc/refman/5.5/en/charset-unicode-utf8mb4.html>`_ - \
     in the MySQL documentation
 
-Unicode Encoding / Decoding
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. _mysql_binary_introducer:
 
-All modern MySQL DBAPIs all offer the service of handling the encoding and
-decoding of unicode data between the Python application space and the database.
-As this was not always the case, SQLAlchemy also includes a comprehensive system
-of performing the encode/decode task as well.   As only one of these systems
-should be in use at at time, SQLAlchemy has long included functionality
-to automatically detect upon first connection whether or not the DBAPI is
-automatically handling unicode.
+Dealing with Binary Data Warnings and Unicode
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Whether or not the MySQL DBAPI will handle encoding can usually be configured
-using a DBAPI flag ``use_unicode``, which is known to be supported at least
-by MySQLdb, PyMySQL, and MySQL-Connector.   Setting this value to ``0``
-in the "connect args" or query string will have the effect of disabling the
-DBAPI's handling of unicode, such that it instead will return data of the
-``str`` type or ``bytes`` type, with data in the configured charset::
+MySQL versions 5.6, 5.7 and later (not MariaDB at the time of this writing) now
+emit a warning when attempting to pass binary data to the database, while a
+character set encoding is also in place, when the binary data itself is not
+valid for that encoding::
 
-    # connect while disabling the DBAPI's unicode encoding/decoding
-    e = create_engine(
-        "mysql+mysqldb://scott:tiger@localhost/test?charset=utf8&use_unicode=0")
+    default.py:509: Warning: (1300, "Invalid utf8mb4 character string: 'F9876A'")
+      cursor.execute(statement, parameters)
 
-Current recommendations for modern DBAPIs are as follows:
+This warning is due to the fact that the MySQL client library is attempting to
+interpret the binary string as a unicode object even if a datatype such as
+:class:`.LargeBinary` is in use.   To resolve this, the SQL statement requires
+a binary "character set introducer" be present before any non-NULL value
+that renders like this::
 
-* It is generally always safe to leave the ``use_unicode`` flag set at
-  its default; that is, don't use it at all.
-* Under Python 3, the ``use_unicode=0`` flag should **never be used**.
-  SQLAlchemy under Python 3 generally assumes the DBAPI receives and returns
-  string values as Python 3 strings, which are inherently unicode objects.
-* Under Python 2 with MySQLdb, the ``use_unicode=0`` flag will **offer
-  superior performance**, as MySQLdb's unicode converters under Python 2 only
-  have been observed to have unusually slow performance compared to SQLAlchemy's
-  fast C-based encoders/decoders.
+    INSERT INTO table (data) VALUES (_binary %s)
 
-In short:  don't specify ``use_unicode`` *at all*, with the possible
-exception of ``use_unicode=0`` on MySQLdb with Python 2 **only** for a
-potential performance gain.
+These character set introducers are provided by the DBAPI driver, assuming
+the use of mysqlclient or PyMySQL (both of which are recommended).  Add the
+query string parameter ``binary_prefix=true`` to the URL to repair this warning::
+
+    # mysqlclient
+    engine = create_engine("mysql+mysqldb://scott:tiger@localhost/test?charset=utf8mb4&binary_prefix=true")
+
+    # PyMySQL
+    engine = create_engine("mysql+pymysql://scott:tiger@localhost/test?charset=utf8mb4&binary_prefix=true")
+
+The ``binary_prefix`` flag may or may not be supported by other MySQL drivers.
+
+SQLAlchemy itself cannot render this ``_binary`` prefix reliably, as it does not
+work with the NULL value, which is valid to be sent as a bound parameter.
+As the MySQL driver renders parameters directly into the SQL string, it's the
+most efficient place for this additional keyword to be passed.
+
+.. seealso::
+
+    `Character set introducers <https://dev.mysql.com/doc/refman/5.7/en/charset-introducer.html>`_ - on the MySQL website
+
 
 Ansi Quoting Style
 ------------------
@@ -360,7 +366,7 @@ an error or to skip performing an UPDATE.
 
 ``ON DUPLICATE KEY UPDATE`` is used to perform an update of the already
 existing row, using any combination of new values as well as values
-from the proposed insertion.   These values are specified using
+from the proposed insertion.   These values are normally specified using
 keyword arguments passed to the
 :meth:`~.mysql.dml.Insert.on_duplicate_key_update`
 given column key values (usually the name of the column, unless it
@@ -368,9 +374,32 @@ specifies :paramref:`.Column.key`) as keys and literal or SQL expressions
 as values::
 
     on_duplicate_key_stmt = insert_stmt.on_duplicate_key_update(
-        data="some data"
-        updated_at=func.current_timestamp()
+        data="some data",
+        updated_at=func.current_timestamp(),
     )
+
+In a manner similar to that of :meth:`.UpdateBase.values`, other parameter
+forms are accepted, including a single dictionary::
+
+    on_duplicate_key_stmt = insert_stmt.on_duplicate_key_update(
+        {"data": "some data", "updated_at": func.current_timestamp()},
+    )
+
+as well as a list of 2-tuples, which will automatically provide
+a parameter-ordered UPDATE statement in a manner similar to that described
+at :ref:`updates_order_parameters`.  Unlike the :class:`.Update` object,
+no special flag is needed to specify the intent since the argument form is
+this context is unambiguous::
+
+    on_duplicate_key_stmt = insert_stmt.on_duplicate_key_update(
+        [
+            ("data", "some data"),
+            ("updated_at", func.current_timestamp()),
+        ],
+    )
+
+.. versionchanged:: 1.3 support for parameter-ordered UPDATE clause within
+   MySQL ON DUPLICATE KEY UPDATE
 
 .. warning::
 
@@ -379,6 +408,8 @@ as values::
     e.g. those specified using :paramref:`.Column.onupdate`.
     These values will not be exercised for an ON DUPLICATE KEY style of UPDATE,
     unless they are manually specified explicitly in the parameters.
+
+
 
 In order to refer to the proposed insertion row, the special alias
 :attr:`~.mysql.dml.Insert.inserted` is available as an attribute on
@@ -524,6 +555,19 @@ More information can be found at:
 http://dev.mysql.com/doc/refman/5.0/en/create-index.html
 
 http://dev.mysql.com/doc/refman/5.0/en/create-table.html
+
+Index Parsers
+~~~~~~~~~~~~~
+
+CREATE FULLTEXT INDEX in MySQL also supports a "WITH PARSER" option.  This
+is available using the keyword argument ``mysql_with_parser``::
+
+    Index(
+        'my_index', my_table.c.data,
+        mysql_prefix='FULLTEXT', mysql_with_parser="ngram")
+
+.. versionadded:: 1.3
+
 
 .. _mysql_foreign_keys:
 
@@ -689,6 +733,7 @@ output::
 
 """
 
+from collections import defaultdict
 import re
 import sys
 import json
@@ -769,10 +814,10 @@ RESERVED_WORDS = set(
      'generated', 'optimizer_costs', 'stored', 'virtual',  # 5.7
 
      'admin', 'cume_dist', 'empty', 'except', 'first_value', 'grouping',
-     'groups', 'json_table', 'last_value', 'nth_value', 'ntile', 'of',
-     'over', 'percent_rank', 'persist', 'persist_only', 'rank', 'recursive',
-     'role', 'row', 'rows', 'row_number', 'system', 'window', # 8.0
-
+     'function', 'groups', 'json_table', 'last_value', 'nth_value',
+     'ntile', 'of', 'over', 'percent_rank', 'persist', 'persist_only',
+     'rank', 'recursive', 'role', 'row', 'rows', 'row_number', 'system',
+     'window',  # 8.0
      ])
 
 AUTOCOMMIT_RE = re.compile(
@@ -907,10 +952,23 @@ class MySQLCompiler(compiler.SQLCompiler):
             self.process(binary.right, **kw))
 
     def visit_on_duplicate_key_update(self, on_duplicate, **kw):
-        cols = self.statement.table.c
+        if on_duplicate._parameter_ordering:
+            parameter_ordering = [
+                elements._column_as_key(key)
+                for key in on_duplicate._parameter_ordering
+            ]
+            ordered_keys = set(parameter_ordering)
+            cols = [
+                self.statement.table.c[key] for key in parameter_ordering
+                if key in self.statement.table.c
+            ] + [
+                c for c in self.statement.table.c if c.key not in ordered_keys
+            ]
+        else:
+            # traverse in table column order
+            cols = self.statement.table.c
 
         clauses = []
-        # traverse in table column order
         for column in cols:
             val = on_duplicate.update.get(column.key)
             if val is None:
@@ -930,7 +988,7 @@ class MySQLCompiler(compiler.SQLCompiler):
             name_text = self.preparer.quote(column.name)
             clauses.append("%s = %s" % (name_text, value_text))
 
-        non_matching = set(on_duplicate.update) - set(cols.keys())
+        non_matching = set(on_duplicate.update) - set(c.key for c in cols)
         if non_matching:
             util.warn(
                 'Additional column names not matching '
@@ -1122,6 +1180,19 @@ class MySQLCompiler(compiler.SQLCompiler):
                                  fromhints=from_hints, **kw)
             for t in [from_table] + extra_froms)
 
+    def visit_empty_set_expr(self, element_types):
+        return (
+            "SELECT %(outer)s FROM (SELECT %(inner)s) "
+            "as _empty_set WHERE 1!=1" % {
+                "inner": ", ".join(
+                    "1 AS _in_%s" % idx
+                    for idx, type_ in enumerate(element_types)),
+                "outer": ", ".join(
+                    "_in_%s" % idx
+                    for idx, type_ in enumerate(element_types))
+            }
+        )
+
 
 class MySQLDDLCompiler(compiler.DDLCompiler):
     def get_column_specification(self, column, **kw):
@@ -1275,6 +1346,10 @@ class MySQLDDLCompiler(compiler.DDLCompiler):
         else:
             columns = ', '.join(columns)
         text += '(%s)' % columns
+
+        parser = index.dialect_options['mysql']['with_parser']
+        if parser is not None:
+            text += " WITH PARSER %s" % (parser, )
 
         using = index.dialect_options['mysql']['using']
         if using is not None:
@@ -1667,6 +1742,8 @@ class MySQLDialect(default.DefaultDialect):
     default_paramstyle = 'format'
     colspecs = colspecs
 
+    cte_follows_insert = True
+
     statement_compiler = MySQLCompiler
     ddl_compiler = MySQLDDLCompiler
     type_compiler = MySQLTypeCompiler
@@ -1693,6 +1770,7 @@ class MySQLDialect(default.DefaultDialect):
             "using": None,
             "length": None,
             "prefix": None,
+            "with_parser": None
         })
     ]
 
@@ -1749,6 +1827,27 @@ class MySQLDialect(default.DefaultDialect):
         if util.py3k and isinstance(val, bytes):
             val = val.decode()
         return val.upper().replace("-", " ")
+
+    def _get_server_version_info(self, connection):
+        # get database server version info explicitly over the wire
+        # to avoid proxy servers like MaxScale getting in the
+        # way with their own values, see #4205
+        dbapi_con = connection.connection
+        cursor = dbapi_con.cursor()
+        cursor.execute("SELECT VERSION()")
+        val = cursor.fetchone()[0]
+        cursor.close()
+        if util.py3k and isinstance(val, bytes):
+            val = val.decode()
+
+        version = []
+        r = re.compile(r'[.\-]')
+        for n in r.split(val):
+            try:
+                version.append(int(n))
+            except ValueError:
+                version.append(n)
+        return tuple(version)
 
     def do_commit(self, dbapi_connection):
         """Execute a COMMIT."""
@@ -1891,6 +1990,10 @@ class MySQLDialect(default.DefaultDialect):
 
         default.DefaultDialect.initialize(self, connection)
 
+        self._needs_correct_for_88718 = (
+            not self._is_mariadb and self.server_version_info >= (8, )
+        )
+
         self._warn_for_known_db_issues()
 
     def _warn_for_known_db_issues(self):
@@ -1921,6 +2024,9 @@ class MySQLDialect(default.DefaultDialect):
 
     @property
     def _mariadb_normalized_version_info(self):
+        # MariaDB's wire-protocol prepends the server_version with
+        # the string "5.5"; now that we use @@version we no longer see this.
+
         if self._is_mariadb:
             idx = self.server_version_info.index('MariaDB')
             return self.server_version_info[idx - 3: idx]
@@ -2039,7 +2145,55 @@ class MySQLDialect(default.DefaultDialect):
                 'options': con_kw
             }
             fkeys.append(fkey_d)
+
+        if self._needs_correct_for_88718:
+            self._correct_for_mysql_bug_88718(fkeys, connection)
+
         return fkeys
+
+    def _correct_for_mysql_bug_88718(self, fkeys, connection):
+        # Foreign key is always in lower case (MySQL 8.0)
+        # https://bugs.mysql.com/bug.php?id=88718
+        # issue #4344 for SQLAlchemy
+
+        default_schema_name = connection.dialect.default_schema_name
+        col_tuples = [
+            (
+                rec['referred_schema'] or default_schema_name,
+                rec['referred_table'],
+                col_name
+            )
+            for rec in fkeys
+            for col_name in rec['referred_columns']
+        ]
+
+        if col_tuples:
+
+            correct_for_wrong_fk_case = connection.execute(
+                sql.text("""
+                    select table_schema, table_name, column_name
+                    from information_schema.columns
+                    where (table_schema, table_name, lower(column_name)) in
+                    :table_data;
+                """).bindparams(
+                    sql.bindparam("table_data", expanding=True)
+                ), table_data=col_tuples
+            )
+
+            d = defaultdict(dict)
+            for schema, tname, cname in correct_for_wrong_fk_case:
+                d[(schema, tname)][cname.lower()] = cname
+
+            for fkey in fkeys:
+                fkey['referred_columns'] = [
+                    d[
+                        (
+                            fkey['referred_schema'] or default_schema_name,
+                            fkey['referred_table']
+                        )
+                    ][col.lower()]
+                    for col in fkey['referred_columns']
+                ]
 
     @reflection.cache
     def get_check_constraints(
@@ -2066,20 +2220,31 @@ class MySQLDialect(default.DefaultDialect):
             connection, table_name, schema, **kw)
 
         indexes = []
+
         for spec in parsed_state.keys:
+            dialect_options = {}
             unique = False
             flavor = spec['type']
             if flavor == 'PRIMARY':
                 continue
             if flavor == 'UNIQUE':
                 unique = True
-            elif flavor in (None, 'FULLTEXT', 'SPATIAL'):
+            elif flavor in ('FULLTEXT', 'SPATIAL'):
+                dialect_options["mysql_prefix"] = flavor
+            elif flavor is None:
                 pass
             else:
                 self.logger.info(
                     "Converting unknown KEY type %s to a plain KEY", flavor)
                 pass
+
+            if spec['parser']:
+                dialect_options['mysql_with_parser'] = spec['parser']
+
             index_d = {}
+            if dialect_options:
+                index_d["dialect_options"] = dialect_options
+
             index_d['name'] = spec['name']
             index_d['column_names'] = [s[0] for s in spec['columns']]
             index_d['unique'] = unique

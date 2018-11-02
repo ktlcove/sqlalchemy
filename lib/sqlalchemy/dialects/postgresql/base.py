@@ -125,6 +125,9 @@ Valid values for ``isolation_level`` include:
 Remote-Schema Table Introspection and PostgreSQL search_path
 ------------------------------------------------------------
 
+**TL;DR;**: keep the ``search_path`` variable set to its default of ``public``,
+name schemas **other** than ``public`` explicitly within ``Table`` defintitions.
+
 The PostgreSQL dialect can reflect tables from any schema.  The
 :paramref:`.Table.schema` argument, or alternatively the
 :paramref:`.MetaData.reflect.schema` argument determines which schema will
@@ -780,7 +783,14 @@ dialect in conjunction with the :class:`.Table` construct:
 
     Table("some_table", metadata, ..., postgresql_inherits=("t1", "t2", ...))
 
-.. versionadded:: 1.0.0
+    .. versionadded:: 1.0.0
+
+* ``PARTITION BY``::
+
+    Table("some_table", metadata, ...,
+          postgresql_partition_by='LIST (part_column)')
+
+    .. versionadded:: 1.2.6
 
 .. seealso::
 
@@ -991,6 +1001,16 @@ class OID(sqltypes.TypeEngine):
 
     """
     __visit_name__ = "OID"
+
+
+class REGCLASS(sqltypes.TypeEngine):
+
+    """Provide the PostgreSQL REGCLASS type.
+
+    .. versionadded:: 1.2.7
+
+    """
+    __visit_name__ = "REGCLASS"
 
 
 class TIMESTAMP(sqltypes.TIMESTAMP):
@@ -1375,6 +1395,7 @@ ischema_names = {
     'macaddr': MACADDR,
     'money': MONEY,
     'oid': OID,
+    'regclass': REGCLASS,
     'double precision': DOUBLE_PRECISION,
     'timestamp': TIMESTAMP,
     'timestamp with time zone': TIMESTAMP,
@@ -1464,6 +1485,18 @@ class PGCompiler(compiler.SQLCompiler):
                 if escape else ''
             )
 
+    def visit_empty_set_expr(self, element_types):
+        # cast the empty set to the type we are comparing against.  if
+        # we are comparing against the null type, pick an arbitrary
+        # datatype for the empty set
+        return 'SELECT %s WHERE 1!=1' % (
+            ", ".join(
+                "CAST(NULL AS %s)" % self.dialect.type_compiler.process(
+                    INTEGER() if type_._isnull else type_,
+                ) for type_ in element_types or [INTEGER()]
+            ),
+        )
+
     def render_literal_value(self, value, type_):
         value = super(PGCompiler, self).render_literal_value(value, type_)
 
@@ -1471,7 +1504,7 @@ class PGCompiler(compiler.SQLCompiler):
             value = value.replace('\\', '\\\\')
         return value
 
-    def visit_sequence(self, seq):
+    def visit_sequence(self, seq, **kw):
         return "nextval('%s')" % self.preparer.format_sequence(seq)
 
     def limit_clause(self, select, **kw):
@@ -1495,7 +1528,7 @@ class PGCompiler(compiler.SQLCompiler):
                 return "DISTINCT "
             elif isinstance(select._distinct, (list, tuple)):
                 return "DISTINCT ON (" + ', '.join(
-                    [self.process(col) for col in select._distinct]
+                    [self.process(col, **kw) for col in select._distinct]
                 ) + ") "
             else:
                 return "DISTINCT ON (" + \
@@ -1829,6 +1862,9 @@ class PGDDLCompiler(compiler.DDLCompiler):
                 ', '.join(self.preparer.quote(name) for name in inherits) +
                 ' )')
 
+        if pg_opts['partition_by']:
+            table_opts.append('\n PARTITION BY %s' % pg_opts['partition_by'])
+
         if pg_opts['with_oids'] is True:
             table_opts.append('\n WITH OIDS')
         elif pg_opts['with_oids'] is False:
@@ -1865,6 +1901,9 @@ class PGTypeCompiler(compiler.GenericTypeCompiler):
 
     def visit_OID(self, type_, **kw):
         return "OID"
+
+    def visit_REGCLASS(self, type_, **kw):
+        return "REGCLASS"
 
     def visit_FLOAT(self, type_, **kw):
         if not type_.precision:
@@ -1967,7 +2006,8 @@ class PGTypeCompiler(compiler.GenericTypeCompiler):
                 "[]" *
                 (type_.dimensions if type_.dimensions is not None else 1)
             )),
-            inner
+            inner,
+            count=1
         )
 
 
@@ -2165,6 +2205,7 @@ class PGDialect(default.DefaultDialect):
         (schema.Table, {
             "ignore_search_path": False,
             "tablespace": None,
+            "partition_by": None,
             "with_oids": None,
             "on_commit": None,
             "inherits": None
@@ -2422,7 +2463,8 @@ class PGDialect(default.DefaultDialect):
             FROM pg_catalog.pg_class c
             LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
             WHERE (%s)
-            AND c.relname = :table_name AND c.relkind in ('r', 'v', 'm', 'f')
+            AND c.relname = :table_name AND c.relkind in
+            ('r', 'v', 'm', 'f', 'p')
         """ % schema_where_clause
         # Since we're binding to unicode, table_name and schema_name must be
         # unicode.
@@ -2453,7 +2495,7 @@ class PGDialect(default.DefaultDialect):
         result = connection.execute(
             sql.text("SELECT c.relname FROM pg_class c "
                      "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                     "WHERE n.nspname = :schema AND c.relkind = 'r'"
+                     "WHERE n.nspname = :schema AND c.relkind in ('r', 'p')"
                      ).columns(relname=sqltypes.Unicode),
             schema=schema if schema is not None else self.default_schema_name)
         return [name for name, in result]
@@ -2560,6 +2602,9 @@ class PGDialect(default.DefaultDialect):
         # strip (*) from character varying(5), timestamp(5)
         # with time zone, geometry(POLYGON), etc.
         attype = re.sub(r'\(.*\)', '', format_type)
+
+        # strip quotes from case sensitive enum names
+        attype = re.sub(r'^"|"$', '', attype)
 
         # strip '[]' from integer[], etc.
         attype = attype.replace('[]', '')
@@ -3090,7 +3135,6 @@ class PGDialect(default.DefaultDialect):
                     'labels': [enum['label']],
                 }
                 enums.append(enum_rec)
-
         return enums
 
     def _load_domains(self, connection):

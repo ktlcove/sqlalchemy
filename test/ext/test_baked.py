@@ -1,19 +1,18 @@
 from sqlalchemy.orm import Session, subqueryload, \
-    mapper, relationship, lazyload, clear_mappers, backref, aliased, \
-    Load, defaultload
+    mapper, relationship, lazyload, backref, aliased, Load, defaultload
 from sqlalchemy.testing import eq_, is_, is_not_
-from sqlalchemy.testing import assert_raises, assert_raises_message
+from sqlalchemy.testing import assert_raises_message
 from sqlalchemy import testing
-from sqlalchemy import inspect
 from test.orm import _fixtures
-from sqlalchemy.ext.baked import BakedQuery
 from sqlalchemy.ext import baked
-from sqlalchemy import bindparam, func, literal_column
+from sqlalchemy import bindparam, func
 from sqlalchemy.orm import exc as orm_exc
+from sqlalchemy.orm.query import Query
 import itertools
 from sqlalchemy.testing import mock
 from sqlalchemy.testing.assertsql import CompiledSQL
 import contextlib
+from sqlalchemy import exc as sa_exc
 
 
 class BakedTest(_fixtures.FixtureTest):
@@ -42,7 +41,9 @@ class StateChangeTest(BakedTest):
         User = self.classes.User
         session = Session()
 
-        def l1(): return session.query(User)
+        def l1():
+            return session.query(User)
+
         q1 = self.bakery(l1)
         self._assert_cache_key(
             q1._cache_key,
@@ -54,9 +55,12 @@ class StateChangeTest(BakedTest):
         User = self.classes.User
         session = Session()
 
-        def l1(): return session.query(User)
+        def l1():
+            return session.query(User)
 
-        def l2(q): return q.filter(User.name == bindparam('name'))
+        def l2(q):
+            return q.filter(User.name == bindparam('name'))
+
         q1 = self.bakery(l1)
         self._assert_cache_key(
             q1._cache_key,
@@ -77,9 +81,12 @@ class StateChangeTest(BakedTest):
         User = self.classes.User
         session = Session()
 
-        def l1(): return session.query(User)
+        def l1():
+            return session.query(User)
 
-        def l2(q): return q.filter(User.name == bindparam('name'))
+        def l2(q):
+            return q.filter(User.name == bindparam('name'))
+
         q1 = self.bakery(l1)
         self._assert_cache_key(
             q1._cache_key,
@@ -97,9 +104,12 @@ class StateChangeTest(BakedTest):
         User = self.classes.User
         session = Session()
 
-        def l1(): return session.query(User)
+        def l1():
+            return session.query(User)
 
-        def l2(q): return q.filter(User.name == bindparam('name'))
+        def l2(q):
+            return q.filter(User.name == bindparam('name'))
+
         q1 = self.bakery(l1)
 
         q2 = q1.with_criteria(l2)
@@ -464,7 +474,9 @@ class ResultTest(BakedTest):
 
         queue = [7, 8]
 
-        def fn(s): return s.query(User.id).filter_by(id=queue.pop(0))
+        def fn(s):
+            return s.query(User.id).filter_by(id=queue.pop(0))
+
         bq1 = self.bakery(fn, 7)
         bq2 = self.bakery(fn, 8)
 
@@ -731,6 +743,64 @@ class ResultTest(BakedTest):
 
                 sess.close()
 
+    def test_to_query_query(self):
+        User = self.classes.User
+        Address = self.classes.Address
+
+        sub_bq = self.bakery(
+            lambda s: s.query(User.name)
+        )
+        sub_bq += lambda q: q.filter(
+            User.id == Address.user_id).filter(User.name == 'ed').\
+            correlate(Address)
+
+        main_bq = self.bakery(lambda s: s.query(Address.id))
+        main_bq += lambda q: q.filter(
+            sub_bq.to_query(q).exists())
+        main_bq += lambda q: q.order_by(Address.id)
+
+        sess = Session()
+        result = main_bq(sess).all()
+        eq_(result, [(2,), (3,), (4,)])
+
+    def test_to_query_session(self):
+        User = self.classes.User
+        Address = self.classes.Address
+
+        sub_bq = self.bakery(
+            lambda s: s.query(User.name)
+        )
+        sub_bq += lambda q: q.filter(
+            User.id == Address.user_id).correlate(Address)
+
+        main_bq = self.bakery(
+            lambda s: s.query(Address.id, sub_bq.to_query(s).as_scalar()))
+        main_bq += lambda q: q.filter(sub_bq.to_query(q).as_scalar() == 'ed')
+        main_bq += lambda q: q.order_by(Address.id)
+
+        sess = Session()
+        result = main_bq(sess).all()
+        eq_(result, [(2, 'ed'), (3, 'ed'), (4, 'ed')])
+
+    def test_to_query_args(self):
+        User = self.classes.User
+        sub_bq = self.bakery(
+            lambda s: s.query(User.name)
+        )
+
+        q = Query([], None)
+        assert_raises_message(
+            sa_exc.ArgumentError,
+            "Given Query needs to be associated with a Session",
+            sub_bq.to_query, q
+        )
+
+        assert_raises_message(
+            TypeError,
+            "Query or Session object expected, got .*'int'.*",
+            sub_bq.to_query, 5
+        )
+
     def test_subquery_eagerloading(self):
         User = self.classes.User
         Address = self.classes.Address
@@ -805,6 +875,35 @@ class ResultTest(BakedTest):
                         self.assert_sql_count(testing.db, go, 3)
 
                 sess.close()
+
+    def test_subqueryload_post_context(self):
+        User = self.classes.User
+        Address = self.classes.Address
+
+        assert_result = [
+            User(id=7,
+                 addresses=[Address(id=1, email_address='jack@bean.com')])
+        ]
+
+        self.bakery = baked.bakery(size=3)
+
+        bq = self.bakery(lambda s: s.query(User))
+
+        bq += lambda q: q.options(subqueryload(User.addresses))
+        bq += lambda q: q.order_by(User.id)
+        bq += lambda q: q.filter(User.name == bindparam('name'))
+        sess = Session()
+
+        def set_params(q):
+            return q.params(name='jack')
+
+        # test that the changes we make using with_post_criteria()
+        # are also applied to the subqueryload query.
+        def go():
+            result = bq(sess).with_post_criteria(set_params).all()
+            eq_(assert_result, result)
+
+        self.assert_sql_count(testing.db, go, 2)
 
 
 class LazyLoaderTest(testing.AssertsCompiledSQL, BakedTest):
@@ -1096,7 +1195,7 @@ class LazyLoaderTest(testing.AssertsCompiledSQL, BakedTest):
                 "addresses_email_address FROM addresses WHERE :param_1 = "
                 "addresses.user_id",
                 {'param_1': 8})
-            )
+        )
 
     def test_useget_cancels_eager_propagated_present(self):
         """test that a one to many lazyload cancels the unnecessary
@@ -1133,10 +1232,153 @@ class LazyLoaderTest(testing.AssertsCompiledSQL, BakedTest):
                 "addresses_email_address FROM addresses WHERE :param_1 = "
                 "addresses.user_id",
                 {'param_1': 8})
-            )
+        )
 
     # additional tests:
     # 1. m2m w lazyload
     # 2. o2m lazyload where m2o backrefs have an eager load, test
     # that eager load is canceled out
     # 3. uselist = False, uselist=False assertion
+
+
+# assert that the integration style illustrated in the dogpile.cache
+# example works w/ baked
+class CustomIntegrationTest(testing.AssertsCompiledSQL, BakedTest):
+    run_setup_mappers = 'each'
+
+    def _o2m_fixture(self, lazy="select", **kw):
+        User = self.classes.User
+        Address = self.classes.Address
+
+        mapper(User, self.tables.users, properties={
+            'addresses': relationship(
+                Address, order_by=self.tables.addresses.c.id,
+                lazy=lazy, **kw)
+        })
+        mapper(Address, self.tables.addresses)
+        return User, Address
+
+    def _query_fixture(self):
+        from sqlalchemy.orm.query import Query, _generative
+
+        class CachingQuery(Query):
+            cache = {}
+
+            @_generative()
+            def set_cache_key(self, key):
+                self._cache_key = key
+
+            def __iter__(self):
+                super_ = super(CachingQuery, self)
+
+                if hasattr(self, '_cache_key'):
+                    return self.get_value(
+                        createfunc=lambda: list(super_.__iter__()))
+                else:
+                    return super_.__iter__()
+
+            def _execute_and_instances(self, context):
+                super_ = super(CachingQuery, self)
+
+                if context.query is not self and hasattr(self, '_cache_key'):
+                    return self.get_value(
+                        createfunc=lambda: list(
+                            super_._execute_and_instances(context)
+                        )
+                    )
+                else:
+                    return super_._execute_and_instances(context)
+
+            def get_value(self, createfunc):
+                if self._cache_key in self.cache:
+                    return iter(self.cache[self._cache_key])
+                else:
+                    self.cache[self._cache_key] = retval = createfunc()
+                    return iter(retval)
+
+        return Session(query_cls=CachingQuery)
+
+    def _option_fixture(self):
+        from sqlalchemy.orm.interfaces import MapperOption
+
+        class RelationshipCache(MapperOption):
+
+            propagate_to_loaders = True
+
+            def process_query_conditionally(self, query):
+                if query._current_path:
+                    query._cache_key = "user7_addresses"
+
+            def _generate_cache_key(self, path):
+                return None
+
+        return RelationshipCache()
+
+    def test_non_baked(self):
+        User, Address = self._o2m_fixture()
+
+        sess = self._query_fixture()
+        q = sess._query_cls
+        eq_(q.cache, {})
+
+        q = sess.query(User).filter(User.id == 7).set_cache_key("user7")
+
+        eq_(
+            q.all(),
+            [User(id=7, addresses=[Address(id=1)])]
+        )
+
+        eq_(q.cache, {"user7": [User(id=7, addresses=[Address(id=1)])]})
+
+        eq_(
+            q.all(),
+            [User(id=7, addresses=[Address(id=1)])]
+        )
+
+    def test_use_w_baked(self):
+        User, Address = self._o2m_fixture()
+
+        sess = self._query_fixture()
+        q = sess._query_cls
+        eq_(q.cache, {})
+
+        base_bq = self.bakery(
+            lambda s: s.query(User))
+        base_bq += lambda q: q.filter(User.id == 7)
+        base_bq += lambda q: q.set_cache_key("user7")
+
+        eq_(
+            base_bq(sess).all(),
+            [User(id=7, addresses=[Address(id=1)])]
+        )
+
+        eq_(q.cache, {"user7": [User(id=7, addresses=[Address(id=1)])]})
+
+        eq_(
+            base_bq(sess).all(),
+            [User(id=7, addresses=[Address(id=1)])]
+        )
+
+    def test_plain_w_baked_lazyload(self):
+        User, Address = self._o2m_fixture()
+        opt = self._option_fixture()
+
+        sess = self._query_fixture()
+        q = sess._query_cls
+        eq_(q.cache, {})
+
+        q = sess.query(User).filter(User.id == 7).options(opt)
+
+        u = q.first()
+        eq_(u.addresses, [Address(id=1)])
+
+        eq_(q.cache, {"user7_addresses": [Address(id=1)]})
+
+        sess.close()
+
+        # ensure caching logic works after query has been baked
+        q.cache.clear()
+
+        u = q.first()
+        eq_(u.addresses, [Address(id=1)])
+        eq_(q.cache, {"user7_addresses": [Address(id=1)]})

@@ -1892,6 +1892,11 @@ class Session(_SessionClassMethods):
          method.
 
 
+        .. seealso::
+
+            :func:`.make_transient_to_detached` - provides for an alternative
+            means of "merging" a single object into the :class:`.Session`
+
         """
 
         if self._warn_on_events:
@@ -2112,9 +2117,9 @@ class Session(_SessionClassMethods):
         Accesses of attributes mapped with :func:`.relationship`
         will attempt to load a value from the database using this
         :class:`.Session` as the source of connectivity.  The values
-        will be loaded based on foreign key values present on this
-        object - it follows that this functionality
-        generally only works for many-to-one-relationships.
+        will be loaded based on foreign key and primary key values
+        present on this object - if not present, then those relationships
+        will be unavailable.
 
         The object will be attached to this session, but will
         **not** participate in any persistence operations; its state
@@ -2135,6 +2140,8 @@ class Session(_SessionClassMethods):
         To make a transient object associated with a :class:`.Session`
         via :meth:`.Session.enable_relationship_loading` pending, add
         it to the :class:`.Session` using :meth:`.Session.add` normally.
+        If the object instead represents an existing idenity in the database,
+        it should be merged using :meth:`.Session.merge`.
 
         :meth:`.Session.enable_relationship_loading` does not improve
         behavior when the ORM is used normally - object references should be
@@ -2149,6 +2156,10 @@ class Session(_SessionClassMethods):
             ``load_on_pending`` at :func:`.relationship` - this flag
             allows per-relationship loading of many-to-ones on items that
             are pending.
+
+            :func:`.make_transient_to_detached` - allows for an object to
+            be added to a :class:`.Session` without SQL emitted, which then
+            will unexpire attributes on access.
 
         """
         state = attributes.instance_state(obj)
@@ -2305,7 +2316,8 @@ class Session(_SessionClassMethods):
 
             is_persistent_orphan = is_orphan and state.has_identity
 
-            if is_orphan and not is_persistent_orphan and state._orphaned_outside_of_session:
+            if is_orphan and not is_persistent_orphan and \
+                    state._orphaned_outside_of_session:
                 self._expunge_states([state])
             else:
                 _reg = flush_context.register_object(
@@ -2369,7 +2381,8 @@ class Session(_SessionClassMethods):
                 transaction.rollback(_capture_exception=True)
 
     def bulk_save_objects(
-            self, objects, return_defaults=False, update_changed_only=True):
+            self, objects, return_defaults=False, update_changed_only=True,
+            preserve_order=True):
         """Perform a bulk save of the given list of objects.
 
         The bulk save feature allows mapped objects to be used as the
@@ -2432,6 +2445,13 @@ class Session(_SessionClassMethods):
          When False, all attributes present are rendered into the SET clause
          with the exception of primary key attributes.
 
+        :param preserve_order: when True, the order of inserts and updates
+         matches exactly the order in which the objects are given.   When
+         False, common types of objects are grouped into inserts
+         and updates, to allow for more batching opportunities.
+
+         .. versionadded:: 1.3
+
         .. seealso::
 
             :ref:`bulk_operations`
@@ -2441,9 +2461,15 @@ class Session(_SessionClassMethods):
             :meth:`.Session.bulk_update_mappings`
 
         """
+        def key(state):
+            return (state.mapper, state.key is not None)
+
+        obj_states = tuple(attributes.instance_state(obj) for obj in objects)
+        if not preserve_order:
+            obj_states = sorted(obj_states, key=key)
+
         for (mapper, isupdate), states in itertools.groupby(
-            (attributes.instance_state(obj) for obj in objects),
-            lambda state: (state.mapper, state.key is not None)
+            obj_states, key
         ):
             self._bulk_save_mappings(
                 mapper, states, isupdate, True,
@@ -3048,6 +3074,8 @@ def make_transient_to_detached(instance):
     .. seealso::
 
         :func:`.make_transient`
+
+        :meth:`.Session.enable_relationship_loading`
 
     """
     state = attributes.instance_state(instance)

@@ -1057,7 +1057,6 @@ class SchemaType(SchemaEventTarget):
         schema = kw.pop('schema', self.schema)
         metadata = kw.pop('metadata', self.metadata)
         _create_events = kw.pop('_create_events', False)
-
         return impltype(name=self.name,
                         schema=schema,
                         inherit_schema=self.inherit_schema,
@@ -1174,7 +1173,6 @@ class Enum(Emulated, String, SchemaType):
             one = 1
             two = 2
             three = 3
-
 
         t = Table(
             'data', MetaData(),
@@ -1443,6 +1441,7 @@ class Enum(Emulated, String, SchemaType):
         kw.setdefault('_create_events', False)
         kw.setdefault('native_enum', self.native_enum)
         kw.setdefault('values_callable', self.values_callable)
+        kw.setdefault('create_constraint', self.create_constraint)
         assert '_enums' in kw
         return impltype(**kw)
 
@@ -1644,7 +1643,8 @@ class Boolean(Emulated, TypeEngine, SchemaType):
     def _should_create_constraint(self, compiler, **kw):
         if not self._is_impl_for_variant(compiler.dialect, kw):
             return False
-        return not compiler.dialect.supports_native_boolean
+        return not compiler.dialect.supports_native_boolean and \
+            compiler.dialect.non_native_boolean_check_constraint
 
     @util.dependencies("sqlalchemy.sql.schema")
     def _set_table(self, schema, column, table):
@@ -1834,8 +1834,13 @@ class JSON(Indexable, TypeEngine):
 
     .. note::  :class:`.types.JSON` is provided as a facade for vendor-specific
        JSON types.  Since it supports JSON SQL operations, it only
-       works on backends that have an actual JSON type, currently
-       PostgreSQL as well as certain versions of MySQL.
+       works on backends that have an actual JSON type, currently:
+
+       * PostgreSQL
+
+       * MySQL as of version 5.7 (MariaDB as of the 10.2 series does not)
+
+       * SQLite as of version 3.9
 
     :class:`.types.JSON` is part of the Core in support of the growing
     popularity of native JSON datatypes.
@@ -2093,7 +2098,7 @@ class JSON(Indexable, TypeEngine):
         @util.dependencies('sqlalchemy.sql.default_comparator')
         def _setup_getitem(self, default_comparator, index):
             if not isinstance(index, util.string_types) and \
-                    isinstance(index, collections.Sequence):
+                    isinstance(index, compat.collections_abc.Sequence):
                 index = default_comparator._check_literal(
                     self.expr, operators.json_path_getitem_op,
                     index, bindparam_type=JSON.JSONPathType

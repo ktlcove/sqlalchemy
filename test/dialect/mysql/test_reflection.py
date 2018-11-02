@@ -4,14 +4,15 @@ from sqlalchemy.testing import eq_, is_
 from sqlalchemy import Column, Table, DDL, MetaData, TIMESTAMP, \
     DefaultClause, String, Integer, Text, UnicodeText, SmallInteger,\
     NCHAR, LargeBinary, DateTime, select, UniqueConstraint, Unicode,\
-    BigInteger
+    BigInteger, Index, ForeignKey
+from sqlalchemy.schema import CreateIndex
 from sqlalchemy import event
 from sqlalchemy import sql
 from sqlalchemy import exc
 from sqlalchemy import inspect
 from sqlalchemy.dialects.mysql import base as mysql
 from sqlalchemy.dialects.mysql import reflection as _reflection
-from sqlalchemy.testing import fixtures, AssertsExecutionResults
+from sqlalchemy.testing import fixtures, AssertsCompiledSQL
 from sqlalchemy import testing
 from sqlalchemy.testing import assert_raises_message, expect_warnings
 import re
@@ -193,7 +194,7 @@ class TypeReflectionTest(fixtures.TestBase):
         self._run_test(specs, ['enums'])
 
 
-class ReflectionTest(fixtures.TestBase, AssertsExecutionResults):
+class ReflectionTest(fixtures.TestBase, AssertsCompiledSQL):
 
     __only_on__ = 'mysql'
     __backend__ = True
@@ -482,6 +483,11 @@ class ReflectionTest(fixtures.TestBase, AssertsExecutionResults):
         # this is ideally one table, but older MySQL versions choke
         # on the multiple TIMESTAMP columns
 
+        row = testing.db.execute(
+            "show variables like '%%explicit_defaults_for_timestamp%%'"
+        ).first()
+        explicit_defaults_for_timestamp = row[1].lower() in ('on', '1', 'true')
+
         reflected = []
         for idx, cols in enumerate([
             [
@@ -527,16 +533,20 @@ class ReflectionTest(fixtures.TestBase, AssertsExecutionResults):
                 {'name': 'p', 'nullable': True,
                  'default': current_timestamp},
                 {'name': 'r', 'nullable': False,
-                 'default':
+                 'default': None if explicit_defaults_for_timestamp else
                  "%(current_timestamp)s ON UPDATE %(current_timestamp)s" %
                  {"current_timestamp": current_timestamp}},
                 {'name': 's', 'nullable': False,
                  'default': current_timestamp},
-                {'name': 't', 'nullable': False,
-                 'default':
+                {'name': 't',
+                 'nullable': True if explicit_defaults_for_timestamp else
+                 False,
+                 'default': None if explicit_defaults_for_timestamp else
                  "%(current_timestamp)s ON UPDATE %(current_timestamp)s" %
                  {"current_timestamp": current_timestamp}},
-                {'name': 'u', 'nullable': False,
+                {'name': 'u',
+                 'nullable': True if explicit_defaults_for_timestamp else
+                 False,
                  'default': current_timestamp},
             ]
         )
@@ -572,6 +582,114 @@ class ReflectionTest(fixtures.TestBase, AssertsExecutionResults):
         self.assert_('uc_a' in indexes)
         self.assert_(indexes['uc_a'].unique)
         self.assert_('uc_a' not in constraints)
+
+    @testing.provide_metadata
+    def test_reflect_fulltext(self):
+        mt = Table(
+            "mytable", self.metadata,
+            Column("id", Integer, primary_key=True),
+            Column("textdata", String(50)),
+            mysql_engine='InnoDB'
+        )
+        Index("textdata_ix", mt.c.textdata, mysql_prefix="FULLTEXT")
+        self.metadata.create_all(testing.db)
+
+        mt = Table(
+            "mytable", MetaData(), autoload_with=testing.db
+        )
+        idx = list(mt.indexes)[0]
+        eq_(idx.name, "textdata_ix")
+        eq_(idx.dialect_options['mysql']['prefix'], "FULLTEXT")
+        self.assert_compile(
+            CreateIndex(idx),
+            "CREATE FULLTEXT INDEX textdata_ix ON mytable (textdata)"
+        )
+
+    @testing.requires.mysql_ngram_fulltext
+    @testing.provide_metadata
+    def test_reflect_fulltext_comment(self):
+        mt = Table(
+            "mytable", self.metadata,
+            Column("id", Integer, primary_key=True),
+            Column("textdata", String(50)),
+            mysql_engine='InnoDB'
+        )
+        Index(
+            "textdata_ix", mt.c.textdata,
+            mysql_prefix="FULLTEXT", mysql_with_parser="ngram")
+
+        self.metadata.create_all(testing.db)
+
+        mt = Table(
+            "mytable", MetaData(), autoload_with=testing.db
+        )
+        idx = list(mt.indexes)[0]
+        eq_(idx.name, "textdata_ix")
+        eq_(idx.dialect_options['mysql']['prefix'], "FULLTEXT")
+        eq_(idx.dialect_options['mysql']['with_parser'], "ngram")
+        self.assert_compile(
+            CreateIndex(idx),
+            "CREATE FULLTEXT INDEX textdata_ix ON mytable "
+            "(textdata) WITH PARSER ngram"
+        )
+
+    @testing.provide_metadata
+    def test_non_column_index(self):
+        m1 = self.metadata
+        t1 = Table(
+            'add_ix', m1, Column('x', String(50)), mysql_engine='InnoDB')
+        Index('foo_idx', t1.c.x.desc())
+        m1.create_all()
+
+        insp = inspect(testing.db)
+        eq_(
+            insp.get_indexes("add_ix"),
+            [{'name': 'foo_idx', 'column_names': ['x'], 'unique': False}]
+        )
+
+    @testing.provide_metadata
+    def test_case_sensitive_column_constraint_reflection(self):
+        # test for issue #4344 which works around
+        # MySQL 8.0 bug https://bugs.mysql.com/bug.php?id=88718
+
+        m1 = self.metadata
+
+        Table(
+            'Track', m1, Column('TrackID', Integer, primary_key=True)
+        )
+        Table(
+            'Track', m1, Column('TrackID', Integer, primary_key=True),
+            schema=testing.config.test_schema
+        )
+        Table(
+            'PlaylistTrack', m1, Column('id', Integer, primary_key=True),
+            Column('TrackID',
+                   ForeignKey('Track.TrackID', name='FK_PlaylistTrackId')),
+            Column(
+                'TTrackID',
+                ForeignKey(
+                    '%s.Track.TrackID' % (testing.config.test_schema,),
+                    name='FK_PlaylistTTrackId'
+                )
+            )
+        )
+        m1.create_all()
+
+        eq_(
+            inspect(testing.db).get_foreign_keys('PlaylistTrack'),
+            [
+                {'name': 'FK_PlaylistTTrackId',
+                 'constrained_columns': ['TTrackID'],
+                 'referred_schema': testing.config.test_schema,
+                 'referred_table': 'Track',
+                 'referred_columns': ['TrackID'], 'options': {}},
+                {'name': 'FK_PlaylistTrackId',
+                 'constrained_columns': ['TrackID'],
+                 'referred_schema': None,
+                 'referred_table': 'Track',
+                 'referred_columns': ['TrackID'], 'options': {}}
+            ]
+        )
 
 
 class RawReflectionTest(fixtures.TestBase):
@@ -611,6 +729,61 @@ class RawReflectionTest(fixtures.TestBase):
             "  KEY (`id`) USING BTREE COMMENT 'prefix''suffix'")
         assert regex.match(
             "  KEY (`id`) USING BTREE COMMENT 'prefix''text''suffix'")
+        # https://forums.mysql.com/read.php?20,567102,567111#msg-567111
+        # "It means if the MySQL version >= 501, execute what's in the comment"
+        assert regex.match(
+            "  FULLTEXT KEY `ix_fulltext_oi_g_name` (`oi_g_name`) "
+            "/*!50100 WITH PARSER `ngram` */ "
+        )
+
+    def test_key_reflection_columns(self):
+        regex = self.parser._re_key
+        exprs = self.parser._re_keyexprs
+        m = regex.match(
+            "  KEY (`id`) USING BTREE COMMENT '''comment'")
+        eq_(m.group("columns"), '`id`')
+
+        m = regex.match(
+            "  KEY (`x`, `y`) USING BTREE")
+        eq_(m.group("columns"), '`x`, `y`')
+
+        eq_(
+            exprs.findall(m.group("columns")),
+            [("x", "", ""), ("y", "", "")]
+        )
+
+        m = regex.match(
+            "  KEY (`x`(25), `y`(15)) USING BTREE")
+        eq_(m.group("columns"), '`x`(25), `y`(15)')
+        eq_(
+            exprs.findall(m.group("columns")),
+            [("x", "25", ""), ("y", "15", "")]
+        )
+
+        m = regex.match(
+            "  KEY (`x`(25) DESC, `y`(15) ASC) USING BTREE")
+        eq_(m.group("columns"), '`x`(25) DESC, `y`(15) ASC')
+        eq_(
+            exprs.findall(m.group("columns")),
+            [("x", "25", "DESC"), ("y", "15", "ASC")]
+        )
+
+        m = regex.match(
+            "  KEY `foo_idx` (`x` DESC)")
+        eq_(m.group("columns"), '`x` DESC')
+        eq_(
+            exprs.findall(m.group("columns")),
+            [("x", "", "DESC")]
+        )
+
+        eq_(
+            exprs.findall(m.group("columns")),
+            [("x", "", "DESC")]
+        )
+
+        m = regex.match(
+            "  KEY `foo_idx` (`x` DESC, `y` ASC)")
+        eq_(m.group("columns"), '`x` DESC, `y` ASC')
 
     def test_fk_reflection(self):
         regex = self.parser._re_fk_constraint

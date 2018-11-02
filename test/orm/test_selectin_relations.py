@@ -1135,14 +1135,12 @@ class BaseRelationFromJoinedSubclassTest(_Polymorphic):
                 {"primary_language_1": "java"}
             ),
             CompiledSQL(
-                "SELECT people_1.person_id AS people_1_person_id, "
+                "SELECT paperwork.person_id AS paperwork_person_id, "
                 "paperwork.paperwork_id AS paperwork_paperwork_id, "
-                "paperwork.description AS paperwork_description, "
-                "paperwork.person_id AS paperwork_person_id "
-                "FROM people AS people_1 JOIN paperwork "
-                "ON people_1.person_id = paperwork.person_id "
-                "WHERE people_1.person_id IN ([EXPANDING_primary_keys]) "
-                "ORDER BY people_1.person_id, paperwork.paperwork_id",
+                "paperwork.description AS paperwork_description "
+                "FROM paperwork WHERE paperwork.person_id "
+                "IN ([EXPANDING_primary_keys]) "
+                "ORDER BY paperwork.person_id, paperwork.paperwork_id",
                 [{'primary_keys': [1]}]
             )
         )
@@ -1180,15 +1178,12 @@ class BaseRelationFromJoinedSubclassTest(_Polymorphic):
                     "description_1": "tps report #2"}
             ),
             CompiledSQL(
-
-                "SELECT people_1.person_id AS people_1_person_id, "
+                "SELECT paperwork.person_id AS paperwork_person_id, "
                 "paperwork.paperwork_id AS paperwork_paperwork_id, "
-                "paperwork.description AS paperwork_description, "
-                "paperwork.person_id AS paperwork_person_id "
-                "FROM people AS people_1 JOIN paperwork "
-                "ON people_1.person_id = paperwork.person_id "
-                "WHERE people_1.person_id IN ([EXPANDING_primary_keys]) "
-                "ORDER BY people_1.person_id, paperwork.paperwork_id",
+                "paperwork.description AS paperwork_description "
+                "FROM paperwork WHERE paperwork.person_id "
+                "IN ([EXPANDING_primary_keys]) "
+                "ORDER BY paperwork.person_id, paperwork.paperwork_id",
                 [{'primary_keys': [1]}]
             )
         )
@@ -1224,14 +1219,12 @@ class BaseRelationFromJoinedSubclassTest(_Polymorphic):
                 "engineers.engineer_id ORDER BY engineers.primary_language "
                 "DESC LIMIT :param_1"),
             CompiledSQL(
-                "SELECT people_1.person_id AS people_1_person_id, "
+                "SELECT paperwork.person_id AS paperwork_person_id, "
                 "paperwork.paperwork_id AS paperwork_paperwork_id, "
-                "paperwork.description AS paperwork_description, "
-                "paperwork.person_id AS paperwork_person_id "
-                "FROM people AS people_1 "
-                "JOIN paperwork ON people_1.person_id = paperwork.person_id "
-                "WHERE people_1.person_id IN ([EXPANDING_primary_keys]) "
-                "ORDER BY people_1.person_id, paperwork.paperwork_id",
+                "paperwork.description AS paperwork_description "
+                "FROM paperwork WHERE paperwork.person_id "
+                "IN ([EXPANDING_primary_keys]) "
+                "ORDER BY paperwork.person_id, paperwork.paperwork_id",
                 [{'primary_keys': [1]}]
             )
         )
@@ -1275,14 +1268,12 @@ class BaseRelationFromJoinedSubclassTest(_Polymorphic):
                 "ORDER BY anon_1.engineers_primary_language DESC "
                 "LIMIT :param_1"),
             CompiledSQL(
-                "SELECT people_1.person_id AS people_1_person_id, "
+                "SELECT paperwork.person_id AS paperwork_person_id, "
                 "paperwork.paperwork_id AS paperwork_paperwork_id, "
-                "paperwork.description AS paperwork_description, "
-                "paperwork.person_id AS paperwork_person_id "
-                "FROM people AS people_1 JOIN paperwork "
-                "ON people_1.person_id = paperwork.person_id "
-                "WHERE people_1.person_id IN ([EXPANDING_primary_keys]) "
-                "ORDER BY people_1.person_id, paperwork.paperwork_id",
+                "paperwork.description AS paperwork_description "
+                "FROM paperwork WHERE paperwork.person_id "
+                "IN ([EXPANDING_primary_keys]) "
+                "ORDER BY paperwork.person_id, paperwork.paperwork_id",
                 [{'primary_keys': [1]}]
             )
         )
@@ -1320,14 +1311,12 @@ class BaseRelationFromJoinedSubclassTest(_Polymorphic):
                 "ON people_1.person_id = engineers_1.engineer_id "
                 "ORDER BY engineers_1.primary_language DESC LIMIT :param_1"),
             CompiledSQL(
-                "SELECT people_1.person_id AS people_1_person_id, "
+                "SELECT paperwork.person_id AS paperwork_person_id, "
                 "paperwork.paperwork_id AS paperwork_paperwork_id, "
-                "paperwork.description AS paperwork_description, "
-                "paperwork.person_id AS paperwork_person_id "
-                "FROM people AS people_1 JOIN paperwork "
-                "ON people_1.person_id = paperwork.person_id "
-                "WHERE people_1.person_id IN ([EXPANDING_primary_keys]) "
-                "ORDER BY people_1.person_id, paperwork.paperwork_id",
+                "paperwork.description AS paperwork_description "
+                "FROM paperwork WHERE paperwork.person_id "
+                "IN ([EXPANDING_primary_keys]) "
+                "ORDER BY paperwork.person_id, paperwork.paperwork_id",
                 [{'primary_keys': [1]}]
 
             )
@@ -1454,6 +1443,8 @@ class HeterogeneousSubtypesTest(fixtures.DeclarativeMappedTest):
             selectinload(Manager.golf_swing),
         ).one()
 
+        # NOTE: we *MUST* do a SQL compare on this one because the adaption
+        # is very sensitive
         def go():
             eq_(company.employees[0].golf_swing.name, "clubs")
 
@@ -1532,24 +1523,21 @@ class ChunkingTest(fixtures.DeclarativeMappedTest):
                 {}
             ),
             CompiledSQL(
-                "SELECT a_1.id AS a_1_id, b.id AS b_id, b.a_id AS b_a_id "
-                "FROM a AS a_1 JOIN b ON a_1.id = b.a_id "
-                "WHERE a_1.id IN ([EXPANDING_primary_keys]) "
-                "ORDER BY a_1.id, b.id",
+                "SELECT b.a_id AS b_a_id, b.id AS b_id "
+                "FROM b WHERE b.a_id IN "
+                "([EXPANDING_primary_keys]) ORDER BY b.a_id, b.id",
                 {"primary_keys": list(range(1, 48))}
             ),
             CompiledSQL(
-                "SELECT a_1.id AS a_1_id, b.id AS b_id, b.a_id AS b_a_id "
-                "FROM a AS a_1 JOIN b ON a_1.id = b.a_id "
-                "WHERE a_1.id IN ([EXPANDING_primary_keys]) "
-                "ORDER BY a_1.id, b.id",
+                "SELECT b.a_id AS b_a_id, b.id AS b_id "
+                "FROM b WHERE b.a_id IN "
+                "([EXPANDING_primary_keys]) ORDER BY b.a_id, b.id",
                 {"primary_keys": list(range(48, 95))}
             ),
             CompiledSQL(
-                "SELECT a_1.id AS a_1_id, b.id AS b_id, b.a_id AS b_a_id "
-                "FROM a AS a_1 JOIN b ON a_1.id = b.a_id "
-                "WHERE a_1.id IN ([EXPANDING_primary_keys]) "
-                "ORDER BY a_1.id, b.id",
+                "SELECT b.a_id AS b_a_id, b.id AS b_id "
+                "FROM b WHERE b.a_id IN "
+                "([EXPANDING_primary_keys]) ORDER BY b.a_id, b.id",
                 {"primary_keys": list(range(95, 101))}
             )
         )
@@ -2126,3 +2114,60 @@ class TestExistingRowPopulation(fixtures.DeclarativeMappedTest):
         a1 = q.all()[0]
         is_true('c1_m2o' in a1.b.__dict__)
         is_true('c2_m2o' in a1.b.__dict__)
+
+
+class SingleInhSubclassTest(
+        fixtures.DeclarativeMappedTest,
+        testing.AssertsExecutionResults):
+
+    @classmethod
+    def setup_classes(cls):
+        Base = cls.DeclarativeBasic
+
+        class User(Base):
+            __tablename__ = 'user'
+
+            id = Column(Integer, primary_key=True)
+            type = Column(String(10))
+
+            __mapper_args__ = {'polymorphic_on': type}
+
+        class EmployerUser(User):
+            roles = relationship('Role', lazy='selectin')
+            __mapper_args__ = {'polymorphic_identity': 'employer'}
+
+        class Role(Base):
+            __tablename__ = 'role'
+
+            id = Column(Integer, primary_key=True)
+            user_id = Column(Integer, ForeignKey('user.id'))
+
+    @classmethod
+    def insert_data(cls):
+        EmployerUser, Role = cls.classes("EmployerUser", "Role")
+
+        s = Session()
+        s.add(EmployerUser(roles=[Role(), Role(), Role()]))
+        s.commit()
+
+    def test_load(self):
+        EmployerUser, = self.classes("EmployerUser")
+        s = Session()
+
+        q = s.query(EmployerUser)
+
+        self.assert_sql_execution(
+            testing.db,
+            q.all,
+            CompiledSQL(
+                'SELECT "user".id AS user_id, "user".type AS user_type '
+                'FROM "user" WHERE "user".type IN (:type_1)',
+                {'type_1': 'employer'}
+            ),
+            CompiledSQL(
+                "SELECT role.user_id AS role_user_id, role.id AS role_id "
+                "FROM role WHERE role.user_id "
+                "IN ([EXPANDING_primary_keys]) ORDER BY role.user_id",
+                {'primary_keys': [1]}
+            ),
+        )

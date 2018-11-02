@@ -13,7 +13,8 @@ from .attributes import QueryableAttribute
 from .. import util
 from ..sql.base import _generative, Generative
 from .. import exc as sa_exc, inspect
-from .base import _is_aliased_class, _class_to_mapper, _is_mapped_class
+from .base import _is_aliased_class, _class_to_mapper, _is_mapped_class, \
+    InspectionAttr
 from . import util as orm_util
 from .path_registry import PathRegistry, TokenRegistry, \
     _WILDCARD_TOKEN, _DEFAULT_TOKEN
@@ -83,50 +84,54 @@ class Load(Generative, MapperOption):
             if key != "loader":
                 continue
 
-            endpoint = obj._of_type or obj.path.path[-1]
-            chopped = self._chop_path(loader_path, path)
+            for local_elem, obj_elem in zip(self.path.path, loader_path):
+                if local_elem is not obj_elem:
+                    break
+            else:
+                endpoint = obj._of_type or obj.path.path[-1]
+                chopped = self._chop_path(loader_path, path)
 
-            if (
-                # means loader_path and path are unrelated,
-                # this does not need to be part of a cache key
-                chopped is None
-            ) or (
-                # means no additional path with loader_path + path
-                # and the endpoint isn't using of_type so isn't modified into
-                # an alias or other unsafe entity
-                not chopped and not obj._of_type
-            ):
-                continue
+                if (
+                    # means loader_path and path are unrelated,
+                    # this does not need to be part of a cache key
+                    chopped is None
+                ) or (
+                    # means no additional path with loader_path + path
+                    # and the endpoint isn't using of_type so isn't modified
+                    # into an alias or other unsafe entity
+                    not chopped and not obj._of_type
+                ):
+                    continue
 
-            serialized_path = []
+                serialized_path = []
 
-            for token in chopped:
-                if isinstance(token, util.string_types):
-                    serialized_path.append(token)
-                elif token.is_aliased_class:
-                    return False
-                elif token.is_property:
-                    serialized_path.append(token.key)
-                else:
-                    assert token.is_mapper
-                    serialized_path.append(token.class_)
+                for token in chopped:
+                    if isinstance(token, util.string_types):
+                        serialized_path.append(token)
+                    elif token.is_aliased_class:
+                        return False
+                    elif token.is_property:
+                        serialized_path.append(token.key)
+                    else:
+                        assert token.is_mapper
+                        serialized_path.append(token.class_)
 
-            if not serialized_path or endpoint != serialized_path[-1]:
-                if endpoint.is_mapper:
-                    serialized_path.append(endpoint.class_)
-                elif endpoint.is_aliased_class:
-                    return False
+                if not serialized_path or endpoint != serialized_path[-1]:
+                    if endpoint.is_mapper:
+                        serialized_path.append(endpoint.class_)
+                    elif endpoint.is_aliased_class:
+                        return False
 
-            serialized.append(
-                (
-                    tuple(serialized_path) +
-                    (obj.strategy or ()) +
-                    (tuple([
-                        (key, obj.local_opts[key])
-                        for key in sorted(obj.local_opts)
-                    ]) if obj.local_opts else ())
+                serialized.append(
+                    (
+                        tuple(serialized_path) +
+                        (obj.strategy or ()) +
+                        (tuple([
+                            (key, obj.local_opts[key])
+                            for key in sorted(obj.local_opts)
+                        ]) if obj.local_opts else ())
+                    )
                 )
-            )
         if not serialized:
             return None
         else:
@@ -381,6 +386,10 @@ class Load(Generative, MapperOption):
 
             if c_token is p_token:
                 continue
+            elif isinstance(c_token, InspectionAttr) and \
+                c_token.is_mapper and p_token.is_mapper and \
+                    c_token.isa(p_token):
+                continue
             else:
                 return None
         return to_chop[i + 1:]
@@ -407,15 +416,19 @@ class _UnboundLoad(Load):
     def _generate_cache_key(self, path):
         serialized = ()
         for val in self._to_bind:
-            opt = val._bind_loader(
-                [path.path[0]],
-                None, None, False)
-            if opt:
-                c_key = opt._generate_cache_key(path)
-                if c_key is False:
-                    return False
-                elif c_key:
-                    serialized += c_key
+            for local_elem, val_elem in zip(self.path, val.path):
+                if local_elem is not val_elem:
+                    break
+            else:
+                opt = val._bind_loader(
+                    [path.path[0]],
+                    None, None, False)
+                if opt:
+                    c_key = opt._generate_cache_key(path)
+                    if c_key is False:
+                        return False
+                    elif c_key:
+                        serialized += c_key
         if not serialized:
             return None
         else:
@@ -439,7 +452,7 @@ class _UnboundLoad(Load):
 
     def __getstate__(self):
         d = self.__dict__.copy()
-        d['path'] = self._serialize_path(self.path)
+        d['path'] = self._serialize_path(self.path, filter_aliased_class=True)
         return d
 
     def __setstate__(self, state):
@@ -454,7 +467,7 @@ class _UnboundLoad(Load):
                     cls, propkey, of_type = key
                 prop = getattr(cls, propkey)
                 if of_type:
-                    prop = prop.of_type(prop)
+                    prop = prop.of_type(of_type)
                 ret.append(prop)
             else:
                 ret.append(key)
@@ -462,10 +475,13 @@ class _UnboundLoad(Load):
         self.__dict__ = state
 
     def _process(self, query, raiseerr):
+        dedupes = query._attributes['_unbound_load_dedupes']
         for val in self._to_bind:
-            val._bind_loader(
-                [ent.entity_zero for ent in query._mapper_entities],
-                query._current_path, query._attributes, raiseerr)
+            if val not in dedupes:
+                dedupes.add(val)
+                val._bind_loader(
+                    [ent.entity_zero for ent in query._mapper_entities],
+                    query._current_path, query._attributes, raiseerr)
 
     @classmethod
     def _from_keys(cls, meth, keys, chained, kw):
@@ -520,19 +536,19 @@ class _UnboundLoad(Load):
 
         return to_chop[i:]
 
-    def _serialize_path(self, path, reject_aliased_class=False):
+    def _serialize_path(self, path, filter_aliased_class=False):
         ret = []
         for token in path:
             if isinstance(token, QueryableAttribute):
-                if reject_aliased_class and (
-                    (token._of_type and
-                        inspect(token._of_type).is_aliased_class)
-                    or
-                    inspect(token.parent).is_aliased_class
-                ):
-                    return False
-                ret.append(
-                    (token._parentmapper.class_, token.key, token._of_type))
+                if filter_aliased_class and token._of_type and \
+                        inspect(token._of_type).is_aliased_class:
+                    ret.append(
+                        (token._parentmapper.class_,
+                         token.key, None))
+                else:
+                    ret.append(
+                        (token._parentmapper.class_, token.key,
+                         token._of_type))
             elif isinstance(token, PropComparator):
                 ret.append((token._parentmapper.class_, token.key, None))
             else:

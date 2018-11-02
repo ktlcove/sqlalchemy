@@ -1,5 +1,5 @@
 from sqlalchemy import Integer, String, ForeignKey, and_, or_, func, \
-    literal, update, table, bindparam, column, select, exc
+    literal, update, table, bindparam, column, select, exc, exists
 from sqlalchemy import testing
 from sqlalchemy.dialects import mysql
 from sqlalchemy.engine import default
@@ -481,6 +481,23 @@ class UpdateFromCompileTest(_UpdateFromTestBase, fixtures.TablesTest,
             dialect='mysql'
         )
 
+    def test_update_from_join_mysql(self):
+        users, addresses = self.tables.users, self.tables.addresses
+
+        j = users.join(addresses)
+        self.assert_compile(
+            update(j).
+            values(name='newname').
+            where(addresses.c.email_address == 'e1'),
+            ""
+            'UPDATE users '
+            'INNER JOIN addresses ON users.id = addresses.user_id '
+            'SET users.name=%s '
+            'WHERE '
+            'addresses.email_address = %s',
+            checkparams={'email_address_1': 'e1', 'name': 'newname'},
+            dialect=mysql.dialect())
+
     def test_render_table(self):
         users, addresses = self.tables.users, self.tables.addresses
 
@@ -574,6 +591,62 @@ class UpdateFromCompileTest(_UpdateFromTestBase, fixtures.TablesTest,
             'AND anon_1.email_address = :email_address_1',
             checkparams=checkparams)
 
+    def test_correlation_to_extra(self):
+        users, addresses = self.tables.users, self.tables.addresses
+
+        stmt = users.update().values(name="newname").where(
+            users.c.id == addresses.c.user_id
+        ).where(
+            ~exists().where(
+                addresses.c.user_id == users.c.id
+            ).where(addresses.c.email_address == 'foo').correlate(addresses)
+        )
+
+        self.assert_compile(
+            stmt,
+            "UPDATE users SET name=:name FROM addresses WHERE "
+            "users.id = addresses.user_id AND NOT "
+            "(EXISTS (SELECT * FROM users WHERE addresses.user_id = users.id "
+            "AND addresses.email_address = :email_address_1))"
+        )
+
+    def test_dont_correlate_to_extra(self):
+        users, addresses = self.tables.users, self.tables.addresses
+
+        stmt = users.update().values(name="newname").where(
+            users.c.id == addresses.c.user_id
+        ).where(
+            ~exists().where(
+                addresses.c.user_id == users.c.id
+            ).where(addresses.c.email_address == 'foo').correlate()
+        )
+
+        self.assert_compile(
+            stmt,
+            "UPDATE users SET name=:name FROM addresses WHERE "
+            "users.id = addresses.user_id AND NOT "
+            "(EXISTS (SELECT * FROM addresses, users "
+            "WHERE addresses.user_id = users.id "
+            "AND addresses.email_address = :email_address_1))"
+        )
+
+    def test_autocorrelate_error(self):
+        users, addresses = self.tables.users, self.tables.addresses
+
+        stmt = users.update().values(name="newname").where(
+            users.c.id == addresses.c.user_id
+        ).where(
+            ~exists().where(
+                addresses.c.user_id == users.c.id
+            ).where(addresses.c.email_address == 'foo')
+        )
+
+        assert_raises_message(
+            exc.InvalidRequestError,
+            ".*returned no FROM clauses due to auto-correlation.*",
+            stmt.compile, dialect=default.StrCompileDialect()
+        )
+
 
 class UpdateFromRoundTripTest(_UpdateFromTestBase, fixtures.TablesTest):
     __backend__ = True
@@ -652,6 +725,35 @@ class UpdateFromRoundTripTest(_UpdateFromTestBase, fixtures.TablesTest):
             addresses.update().
             values(values).
             where(users.c.id == addresses.c.user_id).
+            where(users.c.name == 'ed'))
+
+        expected = [
+            (1, 7, 'x', 'jack@bean.com'),
+            (2, 8, 'x', 'updated'),
+            (3, 8, 'x', 'updated'),
+            (4, 8, 'x', 'updated'),
+            (5, 9, 'x', 'fred@fred.com')]
+        self._assert_addresses(addresses, expected)
+
+        expected = [
+            (7, 'jack'),
+            (8, 'ed2'),
+            (9, 'fred'),
+            (10, 'chuck')]
+        self._assert_users(users, expected)
+
+    @testing.only_on('mysql', 'Multi table update')
+    def test_exec_join_multitable(self):
+        users, addresses = self.tables.users, self.tables.addresses
+
+        values = {
+            addresses.c.email_address: 'updated',
+            users.c.name: 'ed2'
+        }
+
+        testing.db.execute(
+            update(users.join(addresses)).
+            values(values).
             where(users.c.name == 'ed'))
 
         expected = [

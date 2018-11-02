@@ -576,7 +576,7 @@ class LazyLoader(AbstractRelationshipLoader, util.MemoizedSlots):
             return attributes.ATTR_EMPTY
 
         pending = not state.key
-        ident_key = None
+        primary_key_identity = None
 
         if (
             (not passive & attributes.SQL_OK and not self.use_get)
@@ -599,28 +599,36 @@ class LazyLoader(AbstractRelationshipLoader, util.MemoizedSlots):
         # if we have a simple primary key load, check the
         # identity map without generating a Query at all
         if self.use_get:
-            ident = self._get_ident_for_use_get(
+            primary_key_identity = self._get_ident_for_use_get(
                 session,
                 state,
                 passive
             )
-            if attributes.PASSIVE_NO_RESULT in ident:
+            if attributes.PASSIVE_NO_RESULT in primary_key_identity:
                 return attributes.PASSIVE_NO_RESULT
-            elif attributes.NEVER_SET in ident:
+            elif attributes.NEVER_SET in primary_key_identity:
                 return attributes.NEVER_SET
 
-            if _none_set.issuperset(ident):
+            if _none_set.issuperset(primary_key_identity):
                 return None
 
-            ident_key = self.mapper.identity_key_from_primary_key(ident)
-            instance = loading.get_from_identity(session, ident_key, passive)
+            # look for this identity in the identity map.  Delegate to the
+            # Query class in use, as it may have special rules for how it
+            # does this, including how it decides what the correct
+            # identity_token would be for this identity.
+            instance = session.query()._identity_lookup(
+                self.mapper, primary_key_identity, passive=passive,
+                lazy_loaded_from=state
+            )
+
             if instance is not None:
                 return instance
             elif not passive & attributes.SQL_OK or \
                     not passive & attributes.RELATED_OBJECT_OK:
                 return attributes.PASSIVE_NO_RESULT
 
-        return self._emit_lazyload(session, state, ident_key, passive)
+        return self._emit_lazyload(
+            session, state, primary_key_identity, passive)
 
     def _get_ident_for_use_get(self, session, state, passive):
         instance_mapper = state.manager.mapper
@@ -648,7 +656,8 @@ class LazyLoader(AbstractRelationshipLoader, util.MemoizedSlots):
     @util.dependencies(
         "sqlalchemy.orm.strategy_options")
     def _emit_lazyload(
-            self, strategy_options, session, state, ident_key, passive):
+            self, strategy_options, session, state,
+            primary_key_identity, passive):
         # emit lazy load now using BakedQuery, to cut way down on the overhead
         # of generating queries.
         # there are two big things we are trying to guard against here:
@@ -699,6 +708,7 @@ class LazyLoader(AbstractRelationshipLoader, util.MemoizedSlots):
             # caching, for example, since "some_alias" is user-defined and
             # is usually a throwaway object.
             effective_path = state.load_path[self.parent_property]
+
             q._add_lazyload_options(
                 state.load_options, effective_path
             )
@@ -706,8 +716,12 @@ class LazyLoader(AbstractRelationshipLoader, util.MemoizedSlots):
         if self.use_get:
             if self._raise_on_sql:
                 self._invoke_raise_load(state, passive, "raise_on_sql")
-            return q(session)._load_on_ident(
-                session.query(self.mapper), ident_key)
+
+            return q(session).\
+                with_post_criteria(lambda q: q._set_lazyload_from(state)).\
+                _load_on_pk_identity(
+                    session.query(self.mapper),
+                    primary_key_identity)
 
         if self.parent_property.order_by:
             q.add_criteria(
@@ -744,7 +758,17 @@ class LazyLoader(AbstractRelationshipLoader, util.MemoizedSlots):
             self._invoke_raise_load(state, passive, "raise_on_sql")
 
         q.add_criteria(lambda q: q.filter(lazy_clause))
-        result = q(session).params(**params).all()
+
+        # set parameters in the query such that we don't overwrite
+        # parameters that are already set within it
+        def set_default_params(q):
+            params.update(q._params)
+            q._params = params
+            return q
+
+        result = q(session).\
+            with_post_criteria(lambda q: q._set_lazyload_from(state)).\
+            with_post_criteria(set_default_params).all()
         if self.uselist:
             return result
         else:
@@ -1813,8 +1837,8 @@ class JoinedLoader(AbstractRelationshipLoader):
 @properties.RelationshipProperty.strategy_for(lazy="selectin")
 class SelectInLoader(AbstractRelationshipLoader, util.MemoizedSlots):
     __slots__ = (
-        'join_depth', '_parent_alias', '_in_expr', '_parent_pk_cols',
-        '_zero_idx', '_bakery'
+        'join_depth', 'omit_join', '_parent_alias', '_in_expr',
+        '_pk_cols', '_zero_idx', '_bakery'
     )
 
     _chunksize = 500
@@ -1822,9 +1846,46 @@ class SelectInLoader(AbstractRelationshipLoader, util.MemoizedSlots):
     def __init__(self, parent, strategy_key):
         super(SelectInLoader, self).__init__(parent, strategy_key)
         self.join_depth = self.parent_property.join_depth
+
+        if self.parent_property.omit_join is not None:
+            self.omit_join = self.parent_property.omit_join
+        else:
+            lazyloader = self.parent_property._get_strategy(
+                (("lazy", "select"),))
+            self.omit_join = self.parent._get_clause[0].compare(
+                lazyloader._rev_lazywhere,
+                use_proxies=True,
+                equivalents=self.parent._equivalent_columns
+            )
+        if self.omit_join:
+            self._init_for_omit_join()
+        else:
+            self._init_for_join()
+
+    def _init_for_omit_join(self):
+        pk_to_fk = dict(
+            self.parent_property._join_condition.local_remote_pairs
+        )
+        pk_to_fk.update(
+            (equiv, pk_to_fk[k])
+            for k in list(pk_to_fk)
+            for equiv in self.parent._equivalent_columns.get(k, ())
+        )
+
+        self._pk_cols = fk_cols = [
+            pk_to_fk[col]
+            for col in self.parent.primary_key if col in pk_to_fk]
+        if len(fk_cols) > 1:
+            self._in_expr = sql.tuple_(*fk_cols)
+            self._zero_idx = False
+        else:
+            self._in_expr = fk_cols[0]
+            self._zero_idx = True
+
+    def _init_for_join(self):
         self._parent_alias = aliased(self.parent.class_)
         pa_insp = inspect(self._parent_alias)
-        self._parent_pk_cols = pk_cols = [
+        self._pk_cols = pk_cols = [
             pa_insp._adapt_element(col) for col in self.parent.primary_key]
         if len(pk_cols) > 1:
             self._in_expr = sql.tuple_(*pk_cols)
@@ -1898,8 +1959,24 @@ class SelectInLoader(AbstractRelationshipLoader, util.MemoizedSlots):
             for state, overwrite in states
         ]
 
-        pk_cols = self._parent_pk_cols
-        pa = self._parent_alias
+        pk_cols = self._pk_cols
+        in_expr = self._in_expr
+
+        if self.omit_join:
+            # in "omit join" mode, the primary key column and the
+            # "in" expression are in terms of the related entity.  So
+            # if the related entity is polymorphic or otherwise aliased,
+            # we need to adapt our "_pk_cols" and "_in_expr" to that
+            # entity.   in non-"omit join" mode, these are against the
+            # parent entity and do not need adaption.
+            insp = inspect(effective_entity)
+            if insp.is_aliased_class:
+                pk_cols = [
+                    insp._adapt_element(col)
+                    for col in pk_cols
+                ]
+                in_expr = insp._adapt_element(in_expr)
+                pk_cols = [insp._adapt_element(col) for col in pk_cols]
 
         q = self._bakery(
             lambda session: session.query(
@@ -1907,15 +1984,30 @@ class SelectInLoader(AbstractRelationshipLoader, util.MemoizedSlots):
             ), self
         )
 
+        if self.omit_join:
+            # the Bundle we have in the "omit_join" case is against raw, non
+            # annotated columns, so to ensure the Query knows its primary
+            # entity, we add it explictly.  If we made the Bundle against
+            # annotated columns, we hit a performance issue in this specific
+            # case, which is detailed in issue #4347.
+            q.add_criteria(lambda q: q.select_from(effective_entity))
+        else:
+            # in the non-omit_join case, the Bundle is against the annotated/
+            # mapped column of the parent entity, but the #4347 issue does not
+            # occur in this case.
+            pa = self._parent_alias
+            q.add_criteria(
+                lambda q: q.select_from(pa).join(
+                    getattr(pa, self.parent_property.key).of_type(
+                        effective_entity)
+                )
+            )
+
         q.add_criteria(
-            lambda q: q.select_from(pa).join(
-                getattr(pa,
-                        self.parent_property.key).of_type(effective_entity)).
-            filter(
-                self._in_expr.in_(
-                    sql.bindparam('primary_keys', expanding=True))
-            ).order_by(*pk_cols)
-        )
+            lambda q: q.filter(
+                in_expr.in_(
+                    sql.bindparam("primary_keys", expanding=True))
+            ).order_by(*pk_cols))
 
         orig_query = context.query
 
@@ -1930,23 +2022,30 @@ class SelectInLoader(AbstractRelationshipLoader, util.MemoizedSlots):
             )
 
         if self.parent_property.order_by:
-            def _setup_outermost_orderby(q):
-                # imitate the same method that
-                # subquery eager loading does it, looking for the
-                # adapted "secondary" table
-                eagerjoin = q._from_obj[0]
-                eager_order_by = \
-                    eagerjoin._target_adapter.\
-                    copy_and_process(
-                        util.to_list(
-                            self.parent_property.order_by
+            if self.omit_join:
+                eager_order_by = self.parent_property.order_by
+                if insp.is_aliased_class:
+                    eager_order_by = [
+                        insp._adapt_element(elem) for elem in
+                        eager_order_by
+                    ]
+                q.add_criteria(
+                    lambda q: q.order_by(*eager_order_by)
+                )
+            else:
+                def _setup_outermost_orderby(q):
+                    # imitate the same method that subquery eager loading uses,
+                    # looking for the adapted "secondary" table
+                    eagerjoin = q._from_obj[0]
+                    eager_order_by = \
+                        eagerjoin._target_adapter.\
+                        copy_and_process(
+                            util.to_list(self.parent_property.order_by)
                         )
-                    )
-                return q.order_by(*eager_order_by)
-
-            q.add_criteria(
-                _setup_outermost_orderby
-            )
+                    return q.order_by(*eager_order_by)
+                q.add_criteria(
+                    _setup_outermost_orderby
+                )
 
         uselist = self.uselist
         _empty_result = () if uselist else None

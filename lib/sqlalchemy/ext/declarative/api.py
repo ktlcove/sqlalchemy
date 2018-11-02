@@ -17,10 +17,11 @@ from ...util import OrderedDict, hybridmethod, hybridproperty
 from ... import util
 from ... import exc
 import weakref
+import re
 
 from .base import _as_declarative, \
     _declarative_constructor,\
-    _DeferredMapperConfig, _add_attribute
+    _DeferredMapperConfig, _add_attribute, _del_attribute
 from .clsregistry import _class_resolver
 
 
@@ -67,6 +68,8 @@ class DeclarativeMeta(type):
     def __setattr__(cls, key, value):
         _add_attribute(cls, key, value)
 
+    def __delattr__(cls, key):
+        _del_attribute(cls, key)
 
 def synonym_for(name, map_column=False):
     """Decorator that produces an :func:`.orm.synonym` attribute in conjunction
@@ -189,8 +192,8 @@ class declared_attr(interfaces._MappedAttribute, property):
     def __get__(desc, self, cls):
         reg = cls.__dict__.get('_sa_declared_attr_reg', None)
         if reg is None:
-            manager = attributes.manager_of_class(cls)
-            if manager is None:
+            if not re.match(r'^__.+__$', desc.fget.__name__) and \
+                    attributes.manager_of_class(cls) is None:
                 util.warn(
                     "Unmanaged access of declarative attribute %s from "
                     "non-mapped class %s" %

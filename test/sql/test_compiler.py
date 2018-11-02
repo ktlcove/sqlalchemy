@@ -19,7 +19,7 @@ from sqlalchemy import Integer, String, MetaData, Table, Column, select, \
     literal, and_, null, type_coerce, alias, or_, literal_column,\
     Float, TIMESTAMP, Numeric, Date, Text, union, except_,\
     intersect, union_all, Boolean, distinct, join, outerjoin, asc, desc,\
-    over, subquery, case, true, CheckConstraint
+    over, subquery, case, true, CheckConstraint, Sequence
 import decimal
 from sqlalchemy.util import u
 from sqlalchemy import exc, sql, util, types, schema
@@ -28,6 +28,7 @@ from sqlalchemy.sql.expression import ClauseList, _literal_as_text, HasPrefixes
 from sqlalchemy.engine import default
 from sqlalchemy.dialects import mysql, mssql, postgresql, oracle, \
     sqlite, sybase
+from sqlalchemy.dialects.postgresql.base import PGCompiler, PGDialect
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql import compiler
 
@@ -1297,6 +1298,42 @@ class SelectTest(fixtures.TestBase, AssertsCompiledSQL):
             "GROUP BY myothertable.othername ORDER BY myothertable.othername"
         )
 
+    def test_custom_order_by_clause(self):
+        class CustomCompiler(PGCompiler):
+            def order_by_clause(self, select, **kw):
+                return super(CustomCompiler, self).\
+                    order_by_clause(select, **kw) + " CUSTOMIZED"
+
+        class CustomDialect(PGDialect):
+            name = 'custom'
+            statement_compiler = CustomCompiler
+
+        stmt = select([table1.c.myid]).order_by(table1.c.myid)
+        self.assert_compile(
+            stmt,
+            "SELECT mytable.myid FROM mytable ORDER BY "
+            "mytable.myid CUSTOMIZED",
+            dialect=CustomDialect()
+        )
+
+    def test_custom_group_by_clause(self):
+        class CustomCompiler(PGCompiler):
+            def group_by_clause(self, select, **kw):
+                return super(CustomCompiler, self).\
+                    group_by_clause(select, **kw) + " CUSTOMIZED"
+
+        class CustomDialect(PGDialect):
+            name = 'custom'
+            statement_compiler = CustomCompiler
+
+        stmt = select([table1.c.myid]).group_by(table1.c.myid)
+        self.assert_compile(
+            stmt,
+            "SELECT mytable.myid FROM mytable GROUP BY "
+            "mytable.myid CUSTOMIZED",
+            dialect=CustomDialect()
+        )
+
     def test_for_update(self):
         self.assert_compile(
             table1.select(table1.c.myid == 7).with_for_update(),
@@ -2485,6 +2522,50 @@ class SelectTest(fixtures.TestBase, AssertsCompiledSQL):
             func.row_number().over, range_=(-5, 8), rows=(-2, 5)
         )
 
+    def test_over_within_group(self):
+        from sqlalchemy import within_group
+        stmt = select([
+            table1.c.myid,
+            within_group(
+                func.percentile_cont(0.5),
+                table1.c.name.desc()
+            ).over(
+                range_=(1, 2),
+                partition_by=table1.c.name,
+                order_by=table1.c.myid
+            )
+        ])
+        eq_ignore_whitespace(
+            str(stmt),
+            "SELECT mytable.myid, percentile_cont(:percentile_cont_1) "
+            "WITHIN GROUP (ORDER BY mytable.name DESC) "
+            "OVER (PARTITION BY mytable.name ORDER BY mytable.myid "
+            "RANGE BETWEEN :param_1 FOLLOWING AND :param_2 FOLLOWING) "
+            "AS anon_1 FROM mytable"
+        )
+
+        stmt = select([
+            table1.c.myid,
+            within_group(
+                func.percentile_cont(0.5),
+                table1.c.name.desc()
+            ).over(
+                rows=(1, 2),
+                partition_by=table1.c.name,
+                order_by=table1.c.myid
+            )
+        ])
+        eq_ignore_whitespace(
+            str(stmt),
+            "SELECT mytable.myid, percentile_cont(:percentile_cont_1) "
+            "WITHIN GROUP (ORDER BY mytable.name DESC) "
+            "OVER (PARTITION BY mytable.name ORDER BY mytable.myid "
+            "ROWS BETWEEN :param_1 FOLLOWING AND :param_2 FOLLOWING) "
+            "AS anon_1 FROM mytable"
+        )
+
+
+
     def test_date_between(self):
         import datetime
         table = Table('dt', metadata,
@@ -2954,6 +3035,19 @@ class CRUDTest(fixtures.TestBase, AssertsCompiledSQL):
             stmt,
             "INSERT INTO mytable (myid, name) VALUES (3, 'jack')",
             literal_binds=True)
+
+    def test_insert_literal_binds_sequence_notimplemented(self):
+        table = Table('x', MetaData(), Column('y', Integer, Sequence('y_seq')))
+        dialect = default.DefaultDialect()
+        dialect.supports_sequences = True
+
+        stmt = table.insert().values(myid=3, name='jack')
+
+        assert_raises(
+            NotImplementedError,
+            stmt.compile,
+            compile_kwargs=dict(literal_binds=True), dialect=dialect
+        )
 
     def test_update_literal_binds(self):
         stmt = table1.update().values(name='jack').\

@@ -354,7 +354,7 @@ from sqlalchemy.sql import operators as sql_operators
 from sqlalchemy.sql.elements import quoted_name
 from sqlalchemy import types as sqltypes, schema as sa_schema
 from sqlalchemy.types import VARCHAR, NVARCHAR, CHAR, \
-    BLOB, CLOB, TIMESTAMP, FLOAT
+    BLOB, CLOB, TIMESTAMP, FLOAT, INTEGER
 from itertools import groupby
 
 RESERVED_WORDS = \
@@ -411,37 +411,16 @@ class NUMBER(sqltypes.Numeric, sqltypes.Integer):
             return sqltypes.Integer
 
 
-class DOUBLE_PRECISION(sqltypes.Numeric):
+class DOUBLE_PRECISION(sqltypes.Float):
     __visit_name__ = 'DOUBLE_PRECISION'
 
-    def __init__(self, precision=None, scale=None, asdecimal=None):
-        if asdecimal is None:
-            asdecimal = False
 
-        super(DOUBLE_PRECISION, self).__init__(
-            precision=precision, scale=scale, asdecimal=asdecimal)
-
-
-class BINARY_DOUBLE(sqltypes.Numeric):
+class BINARY_DOUBLE(sqltypes.Float):
     __visit_name__ = 'BINARY_DOUBLE'
 
-    def __init__(self, precision=None, scale=None, asdecimal=None):
-        if asdecimal is None:
-            asdecimal = False
 
-        super(BINARY_DOUBLE, self).__init__(
-            precision=precision, scale=scale, asdecimal=asdecimal)
-
-
-class BINARY_FLOAT(sqltypes.Numeric):
+class BINARY_FLOAT(sqltypes.Float):
     __visit_name__ = 'BINARY_FLOAT'
-
-    def __init__(self, precision=None, scale=None, asdecimal=None):
-        if asdecimal is None:
-            asdecimal = False
-
-        super(BINARY_FLOAT, self).__init__(
-            precision=precision, scale=scale, asdecimal=asdecimal)
 
 
 class BFILE(sqltypes.LargeBinary):
@@ -536,6 +515,8 @@ ischema_names = {
     'FLOAT': FLOAT,
     'DOUBLE PRECISION': DOUBLE_PRECISION,
     'LONG': LONG,
+    'BINARY_DOUBLE': BINARY_DOUBLE,
+    'BINARY_FLOAT': BINARY_FLOAT
 }
 
 
@@ -552,7 +533,7 @@ class OracleTypeCompiler(compiler.GenericTypeCompiler):
         return self.visit_FLOAT(type_, **kw)
 
     def visit_unicode(self, type_, **kw):
-        if self.dialect._supports_nchar:
+        if self.dialect._use_nchar_for_unicode:
             return self.visit_NVARCHAR2(type_, **kw)
         else:
             return self.visit_VARCHAR2(type_, **kw)
@@ -585,17 +566,25 @@ class OracleTypeCompiler(compiler.GenericTypeCompiler):
     def visit_BINARY_FLOAT(self, type_, **kw):
         return self._generate_numeric(type_, "BINARY_FLOAT", **kw)
 
+    def visit_FLOAT(self, type_, **kw):
+        # don't support conversion between decimal/binary
+        # precision yet
+        kw['no_precision'] = True
+        return self._generate_numeric(type_, "FLOAT", **kw)
+
     def visit_NUMBER(self, type_, **kw):
         return self._generate_numeric(type_, "NUMBER", **kw)
 
-    def _generate_numeric(self, type_, name, precision=None, scale=None, **kw):
+    def _generate_numeric(
+            self, type_, name, precision=None,
+            scale=None, no_precision=False, **kw):
         if precision is None:
             precision = type_.precision
 
         if scale is None:
             scale = getattr(type_, 'scale', None)
 
-        if precision is None:
+        if no_precision or precision is None:
             return name
         elif scale is None:
             n = "%(name)s(%(precision)s)"
@@ -631,7 +620,7 @@ class OracleTypeCompiler(compiler.GenericTypeCompiler):
         return self.visit_CLOB(type_, **kw)
 
     def visit_unicode_text(self, type_, **kw):
-        if self.dialect._supports_nchar:
+        if self.dialect._use_nchar_for_unicode:
             return self.visit_NCLOB(type_, **kw)
         else:
             return self.visit_CLOB(type_, **kw)
@@ -767,7 +756,7 @@ class OracleCompiler(compiler.SQLCompiler):
     def visit_outer_join_column(self, vc, **kw):
         return self.process(vc.column, **kw) + "(+)"
 
-    def visit_sequence(self, seq):
+    def visit_sequence(self, seq, **kw):
         return (self.dialect.identifier_preparer.format_sequence(seq) +
                 ".nextval")
 
@@ -920,6 +909,9 @@ class OracleCompiler(compiler.SQLCompiler):
     def limit_clause(self, select, **kw):
         return ""
 
+    def visit_empty_set_expr(self, type_):
+        return 'SELECT 1 FROM DUAL WHERE 1!=1'
+
     def for_update_clause(self, select, **kw):
         if self.is_subquery():
             return ""
@@ -1041,6 +1033,7 @@ class OracleDialect(default.DefaultDialect):
     max_identifier_length = 30
 
     supports_simple_order_by_label = False
+    cte_follows_insert = True
 
     supports_sequences = True
     sequences_optional = False
@@ -1063,6 +1056,8 @@ class OracleDialect(default.DefaultDialect):
 
     reflection_options = ('oracle_resolve_synonyms', )
 
+    _use_nchar_for_unicode = False
+
     construct_arguments = [
         (sa_schema.Table, {
             "resolve_synonyms": False,
@@ -1079,9 +1074,11 @@ class OracleDialect(default.DefaultDialect):
                  use_ansi=True,
                  optimize_limits=False,
                  use_binds_for_limits=True,
+                 use_nchar_for_unicode=False,
                  exclude_tablespaces=('SYSTEM', 'SYSAUX', ),
                  **kwargs):
         default.DefaultDialect.__init__(self, **kwargs)
+        self._use_nchar_for_unicode = use_nchar_for_unicode
         self.use_ansi = use_ansi
         self.optimize_limits = optimize_limits
         self.use_binds_for_limits = use_binds_for_limits
@@ -1118,13 +1115,19 @@ class OracleDialect(default.DefaultDialect):
     def _supports_char_length(self):
         return not self._is_oracle_8
 
-    @property
-    def _supports_nchar(self):
-        return not self._is_oracle_8
-
     def do_release_savepoint(self, connection, name):
         # Oracle does not support RELEASE SAVEPOINT
         pass
+
+    def _check_unicode_returns(self, connection):
+        additional_tests = [
+            expression.cast(
+                expression.literal_column("'test nvarchar2 returns'"),
+                sqltypes.NVARCHAR(60)
+            ),
+        ]
+        return super(OracleDialect, self)._check_unicode_returns(
+            connection, additional_tests)
 
     def has_table(self, connection, table_name, schema=None):
         if not schema:
@@ -1414,7 +1417,13 @@ class OracleDialect(default.DefaultDialect):
             comment = row[7]
 
             if coltype == 'NUMBER':
-                coltype = NUMBER(precision, scale)
+                if precision is None and scale == 0:
+                    coltype = INTEGER()
+                else:
+                    coltype = NUMBER(precision, scale)
+            elif coltype == 'FLOAT':
+                # TODO: support "precision" here as "binary_precision"
+                coltype = FLOAT()
             elif coltype in ('VARCHAR2', 'NVARCHAR2', 'CHAR'):
                 coltype = self.ischema_names.get(coltype)(length)
             elif 'WITH TIME ZONE' in coltype:

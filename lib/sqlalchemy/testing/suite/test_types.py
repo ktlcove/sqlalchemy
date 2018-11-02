@@ -5,7 +5,8 @@ from ..assertions import eq_
 from ..config import requirements
 from sqlalchemy import Integer, Unicode, UnicodeText, select, TIMESTAMP
 from sqlalchemy import Date, DateTime, Time, MetaData, String, \
-    Text, Numeric, Float, literal, Boolean, cast, null, JSON, and_, type_coerce
+    Text, Numeric, Float, literal, Boolean, cast, null, JSON, and_, \
+    type_coerce, BigInteger
 from ..schema import Table, Column
 from ... import testing
 import decimal
@@ -337,6 +338,39 @@ class IntegerTest(_LiteralRoundTripFixture, fixtures.TestBase):
     def test_literal(self):
         self._literal_round_trip(Integer, [5], [5])
 
+    def test_huge_int(self):
+        self._round_trip(BigInteger, 1376537018368127)
+
+    @testing.provide_metadata
+    def _round_trip(self, datatype, data):
+        metadata = self.metadata
+        int_table = Table(
+            'integer_table', metadata,
+            Column('id', Integer, primary_key=True,
+                   test_needs_autoincrement=True),
+            Column('integer_data', datatype),
+        )
+
+        metadata.create_all(config.db)
+
+        config.db.execute(
+            int_table.insert(),
+            {'integer_data': data}
+        )
+
+        row = config.db.execute(
+            select([
+                int_table.c.integer_data,
+            ])
+        ).first()
+
+        eq_(row, (data, ))
+
+        if util.py3k:
+            assert isinstance(row[0], int)
+        else:
+            assert isinstance(row[0], (long, int))
+
 
 class NumericTest(_LiteralRoundTripFixture, fixtures.TestBase):
     __backend__ = True
@@ -449,14 +483,27 @@ class NumericTest(_LiteralRoundTripFixture, fixtures.TestBase):
         )
         eq_(val, expr)
 
-    # TODO: this one still breaks on MySQL
-    # def test_decimal_coerce_round_trip(self):
-    #    expr = decimal.Decimal("15.7563")
-    #
-    #    val = testing.db.scalar(
-    #        select([literal(expr)])
-    #    )
-    #    eq_(val, expr)
+    # this does not work in MySQL, see #4036, however we choose not
+    # to render CAST unconditionally since this is kind of an edge case.
+
+    @testing.requires.implicit_decimal_binds
+    @testing.emits_warning(r".*does \*not\* support Decimal objects natively")
+    def test_decimal_coerce_round_trip(self):
+        expr = decimal.Decimal("15.7563")
+
+        val = testing.db.scalar(
+            select([literal(expr)])
+        )
+        eq_(val, expr)
+
+    @testing.emits_warning(r".*does \*not\* support Decimal objects natively")
+    def test_decimal_coerce_round_trip_w_cast(self):
+        expr = decimal.Decimal("15.7563")
+
+        val = testing.db.scalar(
+            select([cast(expr, Numeric(10, 4))])
+        )
+        eq_(val, expr)
 
     @testing.requires.precision_numerics_general
     def test_precision_decimal(self):
@@ -611,6 +658,48 @@ class BooleanTest(_LiteralRoundTripFixture, fixtures.TablesTest):
             row,
             (None, None)
         )
+
+    def test_whereclause(self):
+        # testing "WHERE <column>" renders a compatible expression
+        boolean_table = self.tables.boolean_table
+
+        with config.db.connect() as conn:
+            conn.execute(
+                boolean_table.insert(),
+                [
+                    {'id': 1, 'value': True, 'unconstrained_value': True},
+                    {'id': 2, 'value': False, 'unconstrained_value': False}
+                ]
+            )
+
+            eq_(
+                conn.scalar(
+                    select([boolean_table.c.id]).where(boolean_table.c.value)
+                ),
+                1
+            )
+            eq_(
+                conn.scalar(
+                    select([boolean_table.c.id]).where(
+                        boolean_table.c.unconstrained_value)
+                ),
+                1
+            )
+            eq_(
+                conn.scalar(
+                    select([boolean_table.c.id]).where(~boolean_table.c.value)
+                ),
+                2
+            )
+            eq_(
+                conn.scalar(
+                    select([boolean_table.c.id]).where(
+                        ~boolean_table.c.unconstrained_value)
+                ),
+                2
+            )
+
+
 
 
 class JSONTest(_LiteralRoundTripFixture, fixtures.TablesTest):

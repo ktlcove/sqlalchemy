@@ -6,8 +6,12 @@ from sqlalchemy.dialects.mssql import pyodbc, pymssql, adodbapi
 from sqlalchemy.engine import url
 from sqlalchemy.testing import fixtures
 from sqlalchemy import testing
-from sqlalchemy.testing import assert_raises_message, assert_warnings
+from sqlalchemy.testing import assert_raises_message, \
+    assert_warnings, expect_warnings
 from sqlalchemy.testing.mock import Mock
+from sqlalchemy.dialects.mssql import base
+from sqlalchemy import Integer, String, Table, Column
+from sqlalchemy import event
 
 
 class ParseConnectTest(fixtures.TestBase):
@@ -255,6 +259,40 @@ class EngineFromConfigTest(fixtures.TestBase):
         eq_(e.dialect.legacy_schema_aliasing, False)
 
 
+class FastExecutemanyTest(fixtures.TestBase):
+    __only_on__ = 'mssql'
+    __backend__ = True
+    __requires__ = ('pyodbc_fast_executemany', )
+
+    @testing.provide_metadata
+    def test_flag_on(self):
+        t = Table(
+            't', self.metadata,
+            Column('id', Integer, primary_key=True),
+            Column('data', String(50))
+        )
+        t.create()
+
+        eng = engines.testing_engine(options={"fast_executemany": True})
+
+        @event.listens_for(eng, "after_cursor_execute")
+        def after_cursor_execute(
+                conn, cursor, statement, parameters, context, executemany):
+            if executemany:
+                assert cursor.fast_executemany
+
+        with eng.connect() as conn:
+            conn.execute(
+                t.insert(),
+                [{"id": i, "data": "data_%d" % i} for i in range(100)]
+            )
+
+            conn.execute(
+                t.insert(),
+                {"id": 200, "data": "data_200"}
+            )
+
+
 class VersionDetectionTest(fixtures.TestBase):
     def test_pymssql_version(self):
         dialect = pymssql.MSDialect_pymssql()
@@ -271,3 +309,91 @@ class VersionDetectionTest(fixtures.TestBase):
                 dialect._get_server_version_info(conn),
                 (11, 0, 9216, 62)
             )
+
+    def test_pyodbc_version_productversion(self):
+        dialect = pyodbc.MSDialect_pyodbc()
+
+        conn = Mock(scalar=Mock(return_value="11.0.9216.62"))
+        eq_(
+            dialect._get_server_version_info(conn),
+            (11, 0, 9216, 62)
+        )
+
+    def test_pyodbc_version_fallback(self):
+        dialect = pyodbc.MSDialect_pyodbc()
+        dialect.dbapi = Mock()
+
+        for vers, expected in [
+            ("11.0.9216.62", (11, 0, 9216, 62)),
+            ("notsqlserver.11.foo.0.9216.BAR.62", (11, 0, 9216, 62)),
+            ("Not SQL Server Version 10.5", (5, ))
+        ]:
+            conn = Mock(
+                scalar=Mock(
+                    side_effect=exc.DBAPIError("stmt", "params", None)),
+                connection=Mock(
+                    getinfo=Mock(return_value=vers)
+                )
+            )
+
+            eq_(
+                dialect._get_server_version_info(conn),
+                expected
+            )
+
+
+class IsolationLevelDetectTest(fixtures.TestBase):
+
+    def _fixture(self, view):
+        class Error(Exception):
+            pass
+
+        dialect = pyodbc.MSDialect_pyodbc()
+        dialect.dbapi = Mock(Error=Error)
+        dialect.server_version_info = base.MS_2012_VERSION
+
+        result = []
+
+        def fail_on_exec(stmt, ):
+            if view is not None and view in stmt:
+                result.append(('SERIALIZABLE', ))
+            else:
+                raise Error("that didn't work")
+
+        connection = Mock(
+            cursor=Mock(
+                return_value=Mock(
+                    execute=fail_on_exec,
+                    fetchone=lambda: result[0]
+                ),
+            )
+        )
+
+        return dialect, connection
+
+    def test_dm_pdw_nodes(self):
+        dialect, connection = self._fixture("dm_pdw_nodes_exec_sessions")
+
+        eq_(
+            dialect.get_isolation_level(connection),
+            "SERIALIZABLE"
+        )
+
+    def test_exec_sessions(self):
+        dialect, connection = self._fixture("exec_sessions")
+
+        eq_(
+            dialect.get_isolation_level(connection),
+            "SERIALIZABLE"
+        )
+
+    def test_not_supported(self):
+        dialect, connection = self._fixture(None)
+
+        with expect_warnings("Could not fetch transaction isolation level"):
+            assert_raises_message(
+                NotImplementedError,
+                "Can't fetch isolation",
+                dialect.get_isolation_level, connection
+            )
+

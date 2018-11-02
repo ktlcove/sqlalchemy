@@ -1,6 +1,6 @@
 from sqlalchemy import String, Integer, Column, ForeignKey
-from sqlalchemy.orm import relationship, Session, \
-    selectin_polymorphic, selectinload, with_polymorphic
+from sqlalchemy.orm import relationship, Session, joinedload, \
+    selectin_polymorphic, selectinload, with_polymorphic, backref
 from sqlalchemy.testing import fixtures
 from sqlalchemy import testing
 from sqlalchemy.testing import eq_
@@ -91,21 +91,22 @@ class BaseAndSubFixture(object):
                         {"primary_keys": [2]}
                     ),
                     CompiledSQL(
-                        "SELECT anon_1.a_id AS anon_1_a_id, c.id AS c_id, "
-                        "c.a_sub_id AS c_a_sub_id FROM (SELECT a.id AS a_id, a.adata "
-                        "AS a_adata, a.type AS a_type, asub.id AS asub_id, "
-                        "asub.asubdata AS asub_asubdata FROM a JOIN asub "
-                        "ON a.id = asub.id) AS anon_1 JOIN c "
-                        "ON anon_1.asub_id = c.a_sub_id "
-                        "WHERE anon_1.a_id IN ([EXPANDING_primary_keys]) "
-                        "ORDER BY anon_1.a_id",
+                        # note this links c.a_sub_id to a.id, even though
+                        # primaryjoin is to asub.id.  this is because the
+                        # cols a.id / asub.id are listed in the mapper's
+                        # equivalent_columns so they are guaranteed to store
+                        # the same value.
+                        "SELECT c.a_sub_id AS c_a_sub_id, "
+                        "c.id AS c_id "
+                        "FROM c WHERE c.a_sub_id "
+                        "IN ([EXPANDING_primary_keys]) ORDER BY c.a_sub_id",
                         {"primary_keys": [2]}
                     ),
                 ),
                 CompiledSQL(
-                    "SELECT a_1.id AS a_1_id, b.id AS b_id, b.a_id AS b_a_id "
-                    "FROM a AS a_1 JOIN b ON a_1.id = b.a_id "
-                    "WHERE a_1.id IN ([EXPANDING_primary_keys]) ORDER BY a_1.id",
+                    "SELECT b.a_id AS b_a_id, b.id AS b_id FROM b "
+                    "WHERE b.a_id IN ([EXPANDING_primary_keys]) "
+                    "ORDER BY b.a_id",
                     {"primary_keys": [1, 2]}
                 )
             )
@@ -216,14 +217,12 @@ class FixtureLoadTest(_Polymorphic, testing.AssertsExecutionResults):
                 {}
             ),
             CompiledSQL(
-                "SELECT companies_1.company_id AS companies_1_company_id, "
+                "SELECT people.company_id AS people_company_id, "
                 "people.person_id AS people_person_id, "
-                "people.company_id AS people_company_id, "
                 "people.name AS people_name, people.type AS people_type "
-                "FROM companies AS companies_1 JOIN people "
-                "ON companies_1.company_id = people.company_id "
-                "WHERE companies_1.company_id IN ([EXPANDING_primary_keys]) "
-                "ORDER BY companies_1.company_id, people.person_id",
+                "FROM people WHERE people.company_id "
+                "IN ([EXPANDING_primary_keys]) "
+                "ORDER BY people.company_id, people.person_id",
                 {"primary_keys": [1, 2]}
             ),
             AllOf(
@@ -497,3 +496,169 @@ class TestGeometries(GeometryFixtureBase):
         # the poly loader won't locate a state limited to the "a1" mapper,
         # needs to test that it has states
         sess.query(a)._with_invoke_all_eagers(False).all()
+
+
+class LoaderOptionsTest(
+        fixtures.DeclarativeMappedTest, testing.AssertsExecutionResults):
+    @classmethod
+    def setup_classes(cls):
+        Base = cls.DeclarativeBasic
+
+        class Parent(fixtures.ComparableEntity, Base):
+            __tablename__ = 'parent'
+            id = Column(Integer, primary_key=True)
+
+        class Child(fixtures.ComparableEntity, Base):
+            __tablename__ = 'child'
+            id = Column(Integer, primary_key=True)
+            parent_id = Column(Integer, ForeignKey('parent.id'))
+            parent = relationship('Parent', backref=backref('children'))
+
+            type = Column(String(50), nullable=False)
+            __mapper_args__ = {
+                'polymorphic_on': type,
+            }
+
+        class ChildSubclass1(Child):
+            __tablename__ = 'child_subclass1'
+            id = Column(Integer, ForeignKey('child.id'), primary_key=True)
+            __mapper_args__ = {
+                'polymorphic_identity': 'subclass1',
+                'polymorphic_load': 'selectin'
+            }
+
+        class Other(fixtures.ComparableEntity, Base):
+            __tablename__ = 'other'
+
+            id = Column(Integer, primary_key=True)
+            child_subclass_id = Column(Integer,
+                                       ForeignKey('child_subclass1.id'))
+            child_subclass = relationship('ChildSubclass1',
+                                          backref=backref('others'))
+
+    @classmethod
+    def insert_data(cls):
+        Parent, ChildSubclass1, Other = cls.classes(
+            "Parent", "ChildSubclass1", "Other")
+        session = Session()
+
+        parent = Parent(id=1)
+        subclass1 = ChildSubclass1(id=1, parent=parent)
+        other = Other(id=1, child_subclass=subclass1)
+        session.add_all([parent, subclass1, other])
+        session.commit()
+
+    def test_options_dont_pollute_baked(self):
+        self._test_options_dont_pollute(True)
+
+    def test_options_dont_pollute_unbaked(self):
+        self._test_options_dont_pollute(False)
+
+    def _test_options_dont_pollute(self, enable_baked):
+        Parent, ChildSubclass1, Other = self.classes(
+            "Parent", "ChildSubclass1", "Other")
+        session = Session(enable_baked_queries=enable_baked)
+
+        def no_opt():
+            q = session.query(Parent).options(
+                joinedload(Parent.children.of_type(ChildSubclass1)))
+
+            return self.assert_sql_execution(
+                testing.db,
+                q.all,
+                CompiledSQL(
+                    "SELECT parent.id AS parent_id, "
+                    "anon_1.child_id AS anon_1_child_id, "
+                    "anon_1.child_parent_id AS anon_1_child_parent_id, "
+                    "anon_1.child_type AS anon_1_child_type, "
+                    "anon_1.child_subclass1_id AS anon_1_child_subclass1_id "
+                    "FROM parent "
+                    "LEFT OUTER JOIN (SELECT child.id AS child_id, "
+                    "child.parent_id AS child_parent_id, "
+                    "child.type AS child_type, "
+                    "child_subclass1.id AS child_subclass1_id "
+                    "FROM child "
+                    "LEFT OUTER JOIN child_subclass1 "
+                    "ON child.id = child_subclass1.id) AS anon_1 "
+                    "ON parent.id = anon_1.child_parent_id",
+                    {}
+                ),
+                CompiledSQL(
+                    "SELECT child_subclass1.id AS child_subclass1_id, "
+                    "child.id AS child_id, "
+                    "child.parent_id AS child_parent_id, "
+                    "child.type AS child_type "
+                    "FROM child JOIN child_subclass1 "
+                    "ON child.id = child_subclass1.id "
+                    "WHERE child.id IN ([EXPANDING_primary_keys]) "
+                    "ORDER BY child.id",
+                    [{'primary_keys': [1]}]
+                ),
+            )
+
+        result = no_opt()
+        with self.assert_statement_count(testing.db, 1):
+            eq_(
+                result,
+                [Parent(children=[ChildSubclass1(others=[Other()])])]
+            )
+
+        session.expunge_all()
+
+        q = session.query(Parent).options(
+            joinedload(Parent.children.of_type(ChildSubclass1))
+            .joinedload(ChildSubclass1.others)
+        )
+
+        result = self.assert_sql_execution(
+            testing.db,
+            q.all,
+            CompiledSQL(
+                "SELECT parent.id AS parent_id, "
+                "anon_1.child_id AS anon_1_child_id, "
+                "anon_1.child_parent_id AS anon_1_child_parent_id, "
+                "anon_1.child_type AS anon_1_child_type, "
+                "anon_1.child_subclass1_id AS anon_1_child_subclass1_id, "
+                "other_1.id AS other_1_id, "
+                "other_1.child_subclass_id AS other_1_child_subclass_id "
+                "FROM parent LEFT OUTER JOIN "
+                "(SELECT child.id AS child_id, "
+                "child.parent_id AS child_parent_id, "
+                "child.type AS child_type, "
+                "child_subclass1.id AS child_subclass1_id "
+                "FROM child LEFT OUTER JOIN child_subclass1 "
+                "ON child.id = child_subclass1.id) AS anon_1 "
+                "ON parent.id = anon_1.child_parent_id "
+                "LEFT OUTER JOIN other AS other_1 "
+                "ON anon_1.child_subclass1_id = other_1.child_subclass_id",
+                {}
+            ),
+            CompiledSQL(
+                "SELECT child_subclass1.id AS child_subclass1_id, "
+                "child.id AS child_id, child.parent_id AS child_parent_id, "
+                "child.type AS child_type, other_1.id AS other_1_id, "
+                "other_1.child_subclass_id AS other_1_child_subclass_id "
+                "FROM child JOIN child_subclass1 "
+                "ON child.id = child_subclass1.id "
+                "LEFT OUTER JOIN other AS other_1 "
+                "ON child_subclass1.id = other_1.child_subclass_id "
+                "WHERE child.id IN ([EXPANDING_primary_keys]) "
+                "ORDER BY child.id",
+                [{'primary_keys': [1]}]
+            )
+        )
+
+        with self.assert_statement_count(testing.db, 0):
+            eq_(
+                result,
+                [Parent(children=[ChildSubclass1(others=[Other()])])]
+            )
+
+        session.expunge_all()
+
+        result = no_opt()
+        with self.assert_statement_count(testing.db, 1):
+            eq_(
+                result,
+                [Parent(children=[ChildSubclass1(others=[Other()])])]
+            )

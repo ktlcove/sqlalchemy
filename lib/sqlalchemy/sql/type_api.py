@@ -445,6 +445,20 @@ class TypeEngine(Visitable):
         except KeyError:
             return self._dialect_info(dialect)['impl']
 
+    def _unwrapped_dialect_impl(self, dialect):
+        """Return the 'unwrapped' dialect impl for this type.
+
+        For a type that applies wrapping logic (e.g. TypeDecorator), give
+        us the real, actual dialect-level type that is used.
+
+        This is used by TypeDecorator itself as well at least one case where
+        dialects need to check that a particular specific dialect-level
+        type is in use, within the :meth:`.DefaultDialect.set_input_sizes`
+        method.
+
+        """
+        return self.dialect_impl(dialect)
+
     def _cached_literal_processor(self, dialect):
         """Return a dialect-specific literal processor for this type."""
         try:
@@ -922,7 +936,7 @@ class TypeDecorator(SchemaEventTarget, TypeEngine):
         # otherwise adapt the impl type, link
         # to a copy of this TypeDecorator and return
         # that.
-        typedesc = self.load_dialect_impl(dialect).dialect_impl(dialect)
+        typedesc = self._unwrapped_dialect_impl(dialect)
         tt = self.copy()
         if not isinstance(tt, self.__class__):
             raise AssertionError('Type object %s does not properly '
@@ -988,6 +1002,20 @@ class TypeDecorator(SchemaEventTarget, TypeEngine):
 
         """
         return self.impl
+
+    def _unwrapped_dialect_impl(self, dialect):
+        """Return the 'unwrapped' dialect impl for this type.
+
+        For a type that applies wrapping logic (e.g. TypeDecorator), give
+        us the real, actual dialect-level type that is used.
+
+        This is used by TypeDecorator itself as well at least one case where
+        dialects need to check that a particular specific dialect-level
+        type is in use, within the :meth:`.DefaultDialect.set_input_sizes`
+        method.
+
+        """
+        return self.load_dialect_impl(dialect).dialect_impl(dialect)
 
     def __getattr__(self, key):
         """Proxy all other undefined accessors to the underlying
@@ -1211,6 +1239,33 @@ class TypeDecorator(SchemaEventTarget, TypeEngine):
         else:
             return self.impl.result_processor(dialect, coltype)
 
+    @util.memoized_property
+    def _has_bind_expression(self):
+        return (
+            self.__class__.bind_expression.__code__
+            is not TypeDecorator.bind_expression.__code__
+        ) or self.impl._has_bind_expression
+
+    def bind_expression(self, bindparam):
+        return self.impl.bind_expression(bindparam)
+
+    @util.memoized_property
+    def _has_column_expression(self):
+        """memoized boolean, check if column_expression is implemented.
+
+        Allows the method to be skipped for the vast majority of expression
+        types that don't use this feature.
+
+        """
+
+        return (
+            self.__class__.column_expression.__code__
+            is not TypeDecorator.column_expression.__code__
+        ) or self.impl._has_column_expression
+
+    def column_expression(self, column):
+        return self.impl.column_expression(column)
+
     def coerce_compared_value(self, op, value):
         """Suggest a type for a 'coerced' Python value in an expression.
 
@@ -1269,8 +1324,6 @@ class TypeDecorator(SchemaEventTarget, TypeEngine):
 
     def __repr__(self):
         return util.generic_repr(self, to_inspect=self.impl)
-
-
 
 
 class Variant(TypeDecorator):

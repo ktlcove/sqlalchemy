@@ -934,7 +934,7 @@ class SQLCompiler(Compiled):
     def visit_next_value_func(self, next_value, **kw):
         return self.visit_sequence(next_value.sequence)
 
-    def visit_sequence(self, sequence):
+    def visit_sequence(self, sequence, **kw):
         raise NotImplementedError(
             "Dialect '%s' does not support sequence increments." %
             self.dialect.name
@@ -968,11 +968,7 @@ class SQLCompiler(Compiled):
              for i, c in enumerate(cs.selects))
         )
 
-        group_by = cs._group_by_clause._compiler_dispatch(
-            self, asfrom=asfrom, **kwargs)
-        if group_by:
-            text += " GROUP BY " + group_by
-
+        text += self.group_by_clause(cs, **dict(asfrom=asfrom, **kwargs))
         text += self.order_by_clause(cs, **kwargs)
         text += (cs._limit_clause is not None
                  or cs._offset_clause is not None) and \
@@ -1019,13 +1015,15 @@ class SQLCompiler(Compiled):
                 "Unary expression has no operator or modifier")
 
     def visit_istrue_unary_operator(self, element, operator, **kw):
-        if self.dialect.supports_native_boolean:
+        if element._is_implicitly_boolean or \
+                self.dialect.supports_native_boolean:
             return self.process(element.element, **kw)
         else:
             return "%s = 1" % self.process(element.element, **kw)
 
     def visit_isfalse_unary_operator(self, element, operator, **kw):
-        if self.dialect.supports_native_boolean:
+        if element._is_implicitly_boolean or \
+                self.dialect.supports_native_boolean:
             return "NOT %s" % self.process(element.element, **kw)
         else:
             return "%s = 0" % self.process(element.element, **kw)
@@ -1058,6 +1056,12 @@ class SQLCompiler(Compiled):
                 self._emit_empty_in_warning()
             return self.process(binary.left == binary.left)
 
+    def visit_empty_set_expr(self, element_types):
+        raise NotImplementedError(
+            "Dialect '%s' does not support empty set expression." %
+            self.dialect.name
+        )
+
     def visit_binary(self, binary, override_operator=None,
                      eager_grouping=False, **kw):
 
@@ -1078,6 +1082,9 @@ class SQLCompiler(Compiled):
                 raise exc.UnsupportedCompilationError(self, operator_)
             else:
                 return self._generate_generic_binary(binary, opstring, **kw)
+
+    def visit_function_as_comparison_op_binary(self, element, operator, **kw):
+        return self.process(element.sql_function, **kw)
 
     def visit_mod_binary(self, binary, operator, **kw):
         if self.preparer._double_percents:
@@ -1228,10 +1235,17 @@ class SQLCompiler(Compiled):
                         literal_binds=False,
                         skip_bind_expression=False,
                         **kwargs):
-        if not skip_bind_expression and bindparam.type._has_bind_expression:
-            bind_expression = bindparam.type.bind_expression(bindparam)
-            return self.process(bind_expression,
-                                skip_bind_expression=True)
+
+        if not skip_bind_expression:
+            impl = bindparam.type.dialect_impl(self.dialect)
+            if impl._has_bind_expression:
+                bind_expression = impl.bind_expression(bindparam)
+                return self.process(
+                    bind_expression, skip_bind_expression=True,
+                    within_columns_clause=within_columns_clause,
+                    literal_binds=literal_binds,
+                    **kwargs
+                )
 
         if literal_binds or \
             (within_columns_clause and
@@ -1346,21 +1360,27 @@ class SQLCompiler(Compiled):
             return self.bindtemplate % {'name': name}
 
     def visit_cte(self, cte, asfrom=False, ashint=False,
-                  fromhints=None,
+                  fromhints=None, visiting_cte=None,
                   **kwargs):
         self._init_cte_state()
 
+        kwargs['visiting_cte'] = cte
         if isinstance(cte.name, elements._truncated_label):
             cte_name = self._truncated_identifier("alias", cte.name)
         else:
             cte_name = cte.name
 
+        is_new_cte = True
+        embedded_in_current_named_cte = False
+
         if cte_name in self.ctes_by_name:
             existing_cte = self.ctes_by_name[cte_name]
+            embedded_in_current_named_cte = visiting_cte is existing_cte
+
             # we've generated a same-named CTE that we are enclosed in,
             # or this is the same CTE.  just return the name.
             if cte in existing_cte._restates or cte is existing_cte:
-                return self.preparer.format_alias(cte, cte_name)
+                is_new_cte = False
             elif existing_cte in cte._restates:
                 # we've generated a same-named CTE that is
                 # enclosed in us - we take precedence, so
@@ -1372,67 +1392,75 @@ class SQLCompiler(Compiled):
                     "the same name: %r" %
                     cte_name)
 
-        self.ctes_by_name[cte_name] = cte
+        if asfrom or is_new_cte:
+            if cte._cte_alias is not None:
+                pre_alias_cte = cte._cte_alias
+                cte_pre_alias_name = cte._cte_alias.name
+                if isinstance(cte_pre_alias_name, elements._truncated_label):
+                    cte_pre_alias_name = self._truncated_identifier(
+                        "alias", cte_pre_alias_name)
+            else:
+                pre_alias_cte = cte
+                cte_pre_alias_name = None
 
-        # look for embedded DML ctes and propagate autocommit
-        if 'autocommit' in cte.element._execution_options and \
-                'autocommit' not in self.execution_options:
-            self.execution_options = self.execution_options.union(
-                {"autocommit": cte.element._execution_options['autocommit']})
+        if is_new_cte:
+            self.ctes_by_name[cte_name] = cte
 
-        if cte._cte_alias is not None:
-            orig_cte = cte._cte_alias
-            if orig_cte not in self.ctes:
-                self.visit_cte(orig_cte, **kwargs)
-            cte_alias_name = cte._cte_alias.name
-            if isinstance(cte_alias_name, elements._truncated_label):
-                cte_alias_name = self._truncated_identifier(
-                    "alias", cte_alias_name)
-        else:
-            orig_cte = cte
-            cte_alias_name = None
-        if not cte_alias_name and cte not in self.ctes:
-            if cte.recursive:
-                self.ctes_recursive = True
-            text = self.preparer.format_alias(cte, cte_name)
-            if cte.recursive:
-                if isinstance(cte.original, selectable.Select):
-                    col_source = cte.original
-                elif isinstance(cte.original, selectable.CompoundSelect):
-                    col_source = cte.original.selects[0]
-                else:
-                    assert False
-                recur_cols = [c for c in
-                              util.unique_list(col_source.inner_columns)
-                              if c is not None]
+            # look for embedded DML ctes and propagate autocommit
+            if 'autocommit' in cte.element._execution_options and \
+                    'autocommit' not in self.execution_options:
+                self.execution_options = self.execution_options.union(
+                    {"autocommit":
+                     cte.element._execution_options['autocommit']})
 
-                text += "(%s)" % (", ".join(
-                    self.preparer.format_column(ident)
-                    for ident in recur_cols))
+            if pre_alias_cte not in self.ctes:
+                self.visit_cte(pre_alias_cte, **kwargs)
 
-            if self.positional:
-                kwargs['positional_names'] = self.cte_positional[cte] = []
+            if not cte_pre_alias_name and cte not in self.ctes:
+                if cte.recursive:
+                    self.ctes_recursive = True
+                text = self.preparer.format_alias(cte, cte_name)
+                if cte.recursive:
+                    if isinstance(cte.original, selectable.Select):
+                        col_source = cte.original
+                    elif isinstance(cte.original, selectable.CompoundSelect):
+                        col_source = cte.original.selects[0]
+                    else:
+                        assert False
+                    recur_cols = [c for c in
+                                  util.unique_list(col_source.inner_columns)
+                                  if c is not None]
 
-            text += " AS \n" + \
-                cte.original._compiler_dispatch(
-                    self, asfrom=True, **kwargs
-                )
+                    text += "(%s)" % (", ".join(
+                        self.preparer.format_column(ident)
+                        for ident in recur_cols))
 
-            if cte._suffixes:
-                text += " " + self._generate_prefixes(
-                    cte, cte._suffixes, **kwargs)
+                if self.positional:
+                    kwargs['positional_names'] = self.cte_positional[cte] = []
 
-            self.ctes[cte] = text
+                text += " AS \n" + \
+                    cte.original._compiler_dispatch(
+                        self, asfrom=True, **kwargs
+                    )
+
+                if cte._suffixes:
+                    text += " " + self._generate_prefixes(
+                        cte, cte._suffixes, **kwargs)
+
+                self.ctes[cte] = text
 
         if asfrom:
-            if cte_alias_name:
-                text = self.preparer.format_alias(cte, cte_alias_name)
+            if not is_new_cte and embedded_in_current_named_cte:
+                return self.preparer.format_alias(cte, cte_name)
+
+            if cte_pre_alias_name:
+                text = self.preparer.format_alias(cte, cte_pre_alias_name)
                 if self.preparer._requires_quotes(cte_name):
                     cte_name = self.preparer.quote(cte_name)
                 text += self.get_render_as_alias_suffix(cte_name)
+                return text
             else:
                 return self.preparer.format_alias(cte, cte_name)
-            return text
 
     def visit_alias(self, alias, asfrom=False, ashint=False,
                     iscrud=False,
@@ -1487,10 +1515,12 @@ class SQLCompiler(Compiled):
                              within_columns_clause=True):
         """produce labeled columns present in a select()."""
 
-        if column.type._has_column_expression and \
+        impl = column.type.dialect_impl(self.dialect)
+        if impl._has_column_expression and \
                 populate_result_map:
-            col_expr = column.type.column_expression(column)
-            add_to_result_map = lambda keyname, name, objects, type_: \
+            col_expr = impl.column_expression(column)
+
+            def add_to_result_map(keyname, name, objects, type_):
                 self._add_to_result_map(
                     keyname, name,
                     (column,) + objects, type_)
@@ -1895,10 +1925,7 @@ class SQLCompiler(Compiled):
                 text += " \nWHERE " + t
 
         if select._group_by_clause.clauses:
-            group_by = select._group_by_clause._compiler_dispatch(
-                self, **kwargs)
-            if group_by:
-                text += " GROUP BY " + group_by
+            text += self.group_by_clause(select, **kwargs)
 
         if select._having is not None:
             t = select._having._compiler_dispatch(self, **kwargs)
@@ -1954,7 +1981,18 @@ class SQLCompiler(Compiled):
         """
         return select._distinct and "DISTINCT " or ""
 
+    def group_by_clause(self, select, **kw):
+        """allow dialects to customize how GROUP BY is rendered."""
+
+        group_by = select._group_by_clause._compiler_dispatch(self, **kw)
+        if group_by:
+            return " GROUP BY " + group_by
+        else:
+            return ""
+
     def order_by_clause(self, select, **kw):
+        """allow dialects to customize how ORDER BY is rendered."""
+
         order_by = select._order_by_clause._compiler_dispatch(self, **kw)
         if order_by:
             return " ORDER BY " + order_by
@@ -2091,7 +2129,12 @@ class SQLCompiler(Compiled):
             returning_clause = None
 
         if insert_stmt.select is not None:
-            text += " %s" % self.process(self._insert_from_select, **kw)
+            select_text = self.process(self._insert_from_select, **kw)
+
+            if self.ctes and toplevel and self.dialect.cte_follows_insert:
+                text += " %s%s" % (self._render_cte_clause(), select_text)
+            else:
+                text += " %s" % select_text
         elif not crud_params and supports_default_values:
             text += " DEFAULT VALUES"
         elif insert_stmt._has_multi_parameters:
@@ -2116,7 +2159,7 @@ class SQLCompiler(Compiled):
         if returning_clause and not self.returning_precedes_values:
             text += " " + returning_clause
 
-        if self.ctes and toplevel:
+        if self.ctes and toplevel and not self.dialect.cte_follows_insert:
             text = self._render_cte_clause() + text
 
         self.stack.pop(-1)
@@ -2158,12 +2201,24 @@ class SQLCompiler(Compiled):
     def visit_update(self, update_stmt, asfrom=False, **kw):
         toplevel = not self.stack
 
-        self.stack.append(
-            {'correlate_froms': {update_stmt.table},
-             "asfrom_froms": {update_stmt.table},
-             "selectable": update_stmt})
-
         extra_froms = update_stmt._extra_froms
+        is_multitable = bool(extra_froms)
+
+        if is_multitable:
+            # main table might be a JOIN
+            main_froms = set(selectable._from_objects(update_stmt.table))
+            render_extra_froms = [
+                f for f in extra_froms if f not in main_froms
+            ]
+            correlate_froms = main_froms.union(extra_froms)
+        else:
+            render_extra_froms = []
+            correlate_froms = {update_stmt.table}
+
+        self.stack.append(
+            {'correlate_froms': correlate_froms,
+             "asfrom_froms": correlate_froms,
+             "selectable": update_stmt})
 
         text = "UPDATE "
 
@@ -2172,8 +2227,7 @@ class SQLCompiler(Compiled):
                                             update_stmt._prefixes, **kw)
 
         table_text = self.update_tables_clause(update_stmt, update_stmt.table,
-                                               extra_froms, **kw)
-
+                                               render_extra_froms, **kw)
         crud_params = crud._setup_crud_params(
             self, update_stmt, crud.ISUPDATE, **kw)
 
@@ -2186,7 +2240,7 @@ class SQLCompiler(Compiled):
         text += table_text
 
         text += ' SET '
-        include_table = extra_froms and \
+        include_table = is_multitable and \
             self.render_table_with_column_in_update_from
         text += ', '.join(
             c[0]._compiler_dispatch(self,
@@ -2203,7 +2257,7 @@ class SQLCompiler(Compiled):
             extra_from_text = self.update_from_clause(
                 update_stmt,
                 update_stmt.table,
-                extra_froms,
+                render_extra_froms,
                 dialect_hints, **kw)
             if extra_from_text:
                 text += " " + extra_from_text
@@ -2258,13 +2312,14 @@ class SQLCompiler(Compiled):
     def visit_delete(self, delete_stmt, asfrom=False, **kw):
         toplevel = not self.stack
 
-        self.stack.append({'correlate_froms': {delete_stmt.table},
-                           "asfrom_froms": {delete_stmt.table},
-                           "selectable": delete_stmt})
-
         crud._setup_crud_params(self, delete_stmt, crud.ISDELETE, **kw)
 
         extra_froms = delete_stmt._extra_froms
+
+        correlate_froms = {delete_stmt.table}.union(extra_froms)
+        self.stack.append({'correlate_froms': correlate_froms,
+                           "asfrom_froms": correlate_froms,
+                           "selectable": delete_stmt})
 
         text = "DELETE "
 
@@ -2370,9 +2425,9 @@ class StrSQLCompiler(SQLCompiler):
             for t in extra_froms)
 
     def delete_extra_from_clause(self, update_stmt,
-                           from_table, extra_froms,
-                           from_hints,
-                           **kw):
+                                 from_table, extra_froms,
+                                 from_hints,
+                                 **kw):
         return ', ' + ', '.join(
             t._compiler_dispatch(self, asfrom=True,
                                  fromhints=from_hints, **kw)

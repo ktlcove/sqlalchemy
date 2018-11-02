@@ -86,6 +86,7 @@ class Mapper(InspectionAttr):
     """
 
     _new_mappers = False
+    _dispose_called = False
 
     def __init__(self,
                  class_,
@@ -237,6 +238,10 @@ class Mapper(InspectionAttr):
           be returned inline with the INSERT or UPDATE statement, which can
           greatly enhance performance for an application that needs frequent
           access to just-generated server defaults.
+
+          .. seealso::
+
+                :ref:`orm_server_defaults`
 
           .. versionchanged:: 0.9.0 The ``eager_defaults`` option can now
              make use of :term:`RETURNING` for backends which support it.
@@ -1274,6 +1279,7 @@ class Mapper(InspectionAttr):
     def dispose(self):
         # Disable any attribute-based compilation.
         self.configured = True
+        self._dispose_called = True
 
         if hasattr(self, '_configure_failed'):
             del self._configure_failed

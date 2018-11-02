@@ -28,7 +28,8 @@ import datetime
 import os
 from sqlalchemy import sql
 from sqlalchemy.testing.mock import Mock
-
+from sqlalchemy.testing import mock
+from sqlalchemy import exc
 
 class DialectTest(fixtures.TestBase):
     def test_cx_oracle_version_parse(self):
@@ -48,6 +49,22 @@ class DialectTest(fixtures.TestBase):
             dialect._parse_cx_oracle_ver("6.0b1"),
             (6, 0)
         )
+
+    def test_minimum_version(self):
+        with mock.patch(
+                "sqlalchemy.dialects.oracle.cx_oracle.OracleDialect_cx_oracle."
+                "_parse_cx_oracle_ver", lambda self, vers: (5, 1, 5)):
+            assert_raises_message(
+                exc.InvalidRequestError,
+                "cx_Oracle version 5.2 and above are supported",
+                cx_oracle.OracleDialect_cx_oracle,
+                dbapi=Mock()
+            )
+
+        with mock.patch(
+                "sqlalchemy.dialects.oracle.cx_oracle.OracleDialect_cx_oracle."
+                "_parse_cx_oracle_ver", lambda self, vers: (5, 3, 1)):
+            cx_oracle.OracleDialect_cx_oracle(dbapi=Mock())
 
 
 class OutParamTest(fixtures.TestBase, AssertsExecutionResults):
@@ -162,13 +179,12 @@ class CompatFlagsTest(fixtures.TestBase, AssertsCompiledSQL):
 
         # before connect, assume modern DB
         assert dialect._supports_char_length
-        assert dialect._supports_nchar
         assert dialect.use_ansi
+        assert not dialect._use_nchar_for_unicode
 
         dialect.initialize(Mock())
         assert not dialect.implicit_returning
         assert not dialect._supports_char_length
-        assert not dialect._supports_nchar
         assert not dialect.use_ansi
         self.assert_compile(String(50), "VARCHAR2(50)", dialect=dialect)
         self.assert_compile(Unicode(50), "VARCHAR2(50)", dialect=dialect)
@@ -184,19 +200,29 @@ class CompatFlagsTest(fixtures.TestBase, AssertsCompiledSQL):
         dialect = self._dialect(None)
 
         assert dialect._supports_char_length
-        assert dialect._supports_nchar
+        assert not dialect._use_nchar_for_unicode
         assert dialect.use_ansi
         self.assert_compile(String(50), "VARCHAR2(50 CHAR)", dialect=dialect)
-        self.assert_compile(Unicode(50), "NVARCHAR2(50)", dialect=dialect)
-        self.assert_compile(UnicodeText(), "NCLOB", dialect=dialect)
+        self.assert_compile(Unicode(50), "VARCHAR2(50 CHAR)", dialect=dialect)
+        self.assert_compile(UnicodeText(), "CLOB", dialect=dialect)
 
     def test_ora10_flags(self):
         dialect = self._dialect((10, 2, 5))
 
         dialect.initialize(Mock())
         assert dialect._supports_char_length
-        assert dialect._supports_nchar
+        assert not dialect._use_nchar_for_unicode
         assert dialect.use_ansi
+        self.assert_compile(String(50), "VARCHAR2(50 CHAR)", dialect=dialect)
+        self.assert_compile(Unicode(50), "VARCHAR2(50 CHAR)", dialect=dialect)
+        self.assert_compile(UnicodeText(), "CLOB", dialect=dialect)
+
+    def test_use_nchar(self):
+        dialect = self._dialect((10, 2, 5), use_nchar_for_unicode=True)
+
+        dialect.initialize(Mock())
+        assert dialect._use_nchar_for_unicode
+
         self.assert_compile(String(50), "VARCHAR2(50 CHAR)", dialect=dialect)
         self.assert_compile(Unicode(50), "NVARCHAR2(50)", dialect=dialect)
         self.assert_compile(UnicodeText(), "NCLOB", dialect=dialect)

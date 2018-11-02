@@ -87,6 +87,19 @@ class MySQLDialect_mysqldb(MySQLDialect):
     def __init__(self, server_side_cursors=False, **kwargs):
         super(MySQLDialect_mysqldb, self).__init__(**kwargs)
         self.server_side_cursors = server_side_cursors
+        self._mysql_dbapi_version = self._parse_dbapi_version(
+            self.dbapi.__version__) if self.dbapi is not None \
+            and hasattr(self.dbapi, '__version__') else (0, 0, 0)
+
+    def _parse_dbapi_version(self, version):
+        m = re.match(r'(\d+)\.(\d+)(?:\.(\d+))?', version)
+        if m:
+            return tuple(
+                int(x)
+                for x in m.group(1, 2, 3)
+                if x is not None)
+        else:
+            return (0, 0, 0)
 
     @util.langhelpers.memoized_property
     def supports_server_side_cursors(self):
@@ -101,6 +114,17 @@ class MySQLDialect_mysqldb(MySQLDialect):
     def dbapi(cls):
         return __import__('MySQLdb')
 
+    def do_ping(self, dbapi_connection):
+        try:
+            dbapi_connection.ping(False)
+        except self.dbapi.Error as err:
+            if self.is_disconnect(err, dbapi_connection, None):
+                return False
+            else:
+                raise
+        else:
+            return True
+
     def do_executemany(self, cursor, statement, parameters, context=None):
         rowcount = cursor.executemany(statement, parameters)
         if context is not None:
@@ -109,21 +133,21 @@ class MySQLDialect_mysqldb(MySQLDialect):
     def _check_unicode_returns(self, connection):
         # work around issue fixed in
         # https://github.com/farcepest/MySQLdb1/commit/cd44524fef63bd3fcb71947392326e9742d520e8
-        # specific issue w/ the utf8_bin collation and unicode returns
+        # specific issue w/ the utf8mb4_bin collation and unicode returns
 
-        has_utf8_bin = self.server_version_info > (5, ) and \
+        has_utf8mb4_bin = self.server_version_info > (5, ) and \
             connection.scalar(
-                "show collation where %s = 'utf8' and %s = 'utf8_bin'"
+                "show collation where %s = 'utf8mb4' and %s = 'utf8mb4_bin'"
                 % (
                     self.identifier_preparer.quote("Charset"),
                     self.identifier_preparer.quote("Collation")
                 ))
-        if has_utf8_bin:
+        if has_utf8mb4_bin:
             additional_tests = [
                 sql.collate(sql.cast(
                     sql.literal_column(
                             "'test collated returns'"),
-                    TEXT(charset='utf8')), "utf8_bin")
+                    TEXT(charset='utf8mb4')), "utf8mb4_bin")
             ]
         else:
             additional_tests = []
@@ -172,17 +196,6 @@ class MySQLDialect_mysqldb(MySQLDialect):
                 self.supports_sane_rowcount = False
             opts['client_flag'] = client_flag
         return [[], opts]
-
-    def _get_server_version_info(self, connection):
-        dbapi_con = connection.connection
-        version = []
-        r = re.compile(r'[.\-]')
-        for n in r.split(dbapi_con.get_server_info()):
-            try:
-                version.append(int(n))
-            except ValueError:
-                version.append(n)
-        return tuple(version)
 
     def _extract_error_code(self, exception):
         return exception.args[0]

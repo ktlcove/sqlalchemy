@@ -74,6 +74,51 @@ class ForeignTableReflectionTest(fixtures.TablesTest, AssertsExecutionResults):
             eq_(names, ['testtable'])
 
 
+class PartitionedReflectionTest(
+        fixtures.TablesTest, AssertsExecutionResults):
+    # partitioned table reflection, issue #4237
+
+    __only_on__ = 'postgresql >= 10'
+    __backend__ = True
+
+    @classmethod
+    def define_tables(cls, metadata):
+        # the actual function isn't reflected yet
+        dv = Table(
+            'data_values', metadata,
+            Column('modulus', Integer, nullable=False),
+            Column('data', String(30)),
+            postgresql_partition_by='range(modulus)')
+
+        # looks like this is reflected prior to #4237
+        sa.event.listen(
+            dv,
+            "after_create",
+            sa.DDL(
+                "CREATE TABLE data_values_4_10 PARTITION OF data_values "
+                "FOR VALUES FROM (4) TO (10)")
+        )
+
+    def test_get_tablenames(self):
+        assert {'data_values', 'data_values_4_10'}.issubset(
+            inspect(testing.db).get_table_names()
+        )
+
+    def test_reflect_cols(self):
+        cols = inspect(testing.db).get_columns('data_values')
+        eq_(
+            [c['name'] for c in cols],
+            ['modulus', 'data']
+        )
+
+    def test_reflect_cols_from_partition(self):
+        cols = inspect(testing.db).get_columns('data_values_4_10')
+        eq_(
+            [c['name'] for c in cols],
+            ['modulus', 'data']
+        )
+
+
 class MaterializedViewReflectionTest(
         fixtures.TablesTest, AssertsExecutionResults):
     """Test reflection on materialized views"""
@@ -907,6 +952,41 @@ class ReflectionTest(fixtures.TestBase):
                 'name': 'pet',
                 'schema': 'public'
             }])
+
+    @testing.provide_metadata
+    def test_inspect_enums_case_sensitive(self):
+        enum_type = postgresql.ENUM(
+            'CapsOne', 'CapsTwo', name='UpperCase', metadata=self.metadata)
+        enum_type.create(testing.db)
+        inspector = reflection.Inspector.from_engine(testing.db)
+        eq_(inspector.get_enums(), [
+            {
+                'visible': True,
+                'labels': ['CapsOne', 'CapsTwo'],
+                'name': 'UpperCase',
+                'schema': 'public'
+            }])
+
+    @testing.provide_metadata
+    def test_inspect_enums_case_sensitive_from_table(self):
+        enum_type = postgresql.ENUM(
+            'CapsOne', 'CapsTwo', name='UpperCase', metadata=self.metadata)
+
+        t = Table('t', self.metadata, Column('q', enum_type))
+
+        enum_type.create(testing.db)
+        t.create(testing.db)
+
+        inspector = reflection.Inspector.from_engine(testing.db)
+        cols = inspector.get_columns("t")
+        cols[0]['type'] = (cols[0]['type'].name, cols[0]['type'].enums)
+        eq_(cols, [
+            {
+                'name': 'q',
+                'type': ('UpperCase', ['CapsOne', 'CapsTwo']),
+                'nullable': True, 'default': None,
+                'autoincrement': False, 'comment': None}
+        ])
 
     @testing.provide_metadata
     def test_inspect_enums_star(self):
